@@ -162,7 +162,7 @@ Each task is small and deterministic to check. Each exercises a different skill.
 | `rs-method` | Rust feature | add `Stack::peek` with a test | hidden test file plus `cargo test` |
 | `js-fix` | Node bugfix | fix `formatDuration` | node assertion script |
 | `env-tool` | Environment | write a script that prints the SHA-256 of each `data/*.txt`, sorted by name | compares the output |
-| `long-context` | Long context and compaction | across 25 small modules, list every function that writes to the global `CONFIG` in `FINDINGS.md`; runs with `budget: 30000` | exact set comparison |
+| `long-context` | Long context and compaction | across 25 small modules, list every function that writes to the global `CONFIG` in `FINDINGS.md`; runs with `budget: 15000` | exact set comparison |
 
 Toolchains used: Python 3, Rust/cargo, Node and Git Bash. All four are present on this machine. A task whose toolchain is missing is reported as `skipped` and doesn't count as a failure.
 

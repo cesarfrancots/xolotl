@@ -52,3 +52,12 @@ Per attempt, from Xolotl's JSON-lines events: `pass` (every verify command exite
 `status` is `pass`, `fail` or `skipped`; skipped attempts count in `total` but not in `pass_rate`.
 
 `summary` totals these per run: pass count and rate, `per_task` as `k/N`, summed tokens, median and total wall time.
+
+## Task notes
+
+- `long-context` (`budget: 15000`): compaction depends on the agent's read strategy. Reading the files one by one usually crosses
+  stage 1 (60% of the budget); grepping first may never compact, so `compactions` can legitimately be 0 on a passing attempt.
+- `long-context`: every `mod_NN:name` token in `FINDINGS.md` counts, so listing non-writers in that format (for example in a
+  "not writers" section) fails the check.
+- `env-tool`: each line must use the bare file name, not `data/<name>`, and Git Bash's `sha256sum` default ` *name` marker fails
+  the check. Both are stated in the prompt ("<sha256 hex>  <file name>", two spaces).

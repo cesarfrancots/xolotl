@@ -6,6 +6,6 @@
   "verify": ["{python} verify/check.py"],
   "timeout_s": 900,
   "verify_timeout_s": 60,
-  "budget": 30000,
+  "budget": 15000,
   "requires": []
 }
