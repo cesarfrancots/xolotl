@@ -25,6 +25,8 @@ pub struct PermissionRequest {
     pub tool: String,
     pub summary: String,
     pub detail: Option<String>,
+    /// What "always" would grant (`Perms::grant_preview`).
+    pub always: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -186,6 +188,12 @@ pub fn status_line(s: &Status) -> String {
         s.elapsed_ms / 1000,
         s.cached_pct
     )
+}
+
+/// The permission prompt's last line; `[a]lways` names what it grants.
+fn ask_prompt(req: &PermissionRequest) -> String {
+    let always = if req.always.is_empty() { String::new() } else { format!(" ({})", req.always) };
+    format!("    allow {}? [y]es [n]o [a]lways{always} › ", req.tool)
 }
 
 /// What a keypress at a permission prompt means: the decision, and whether it also cancels the run (Ctrl+C).
@@ -500,7 +508,7 @@ impl Ui for Terminal {
         if let Some(detail) = &req.detail {
             self.block(detail, true);
         }
-        self.prompt(&format!("    allow {}? [y]es [n]o [a]lways › ", req.tool), true)
+        self.prompt(&ask_prompt(req), true)
     }
 
     fn confirm(&mut self, question: &str) -> bool {
@@ -671,8 +679,16 @@ mod tests {
         let parsed: Vec<Event> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(parsed, vec![e1, e2]);
 
-        let req = PermissionRequest { tool: "bash".into(), summary: "ls".into(), detail: None };
+        let req = PermissionRequest { tool: "bash".into(), summary: "ls".into(), detail: None, always: "ls".into() };
         assert_eq!(h.ask(&req), Decision::Deny);
         assert!(!h.confirm("continue?"));
+    }
+
+    #[test]
+    fn ask_prompt_names_the_grant() {
+        let req = |tool: &str, always: &str| PermissionRequest { tool: tool.into(), summary: String::new(), detail: None, always: always.into() };
+        assert_eq!(ask_prompt(&req("bash", "cargo test, tail -20")), "    allow bash? [y]es [n]o [a]lways (cargo test, tail -20) › ");
+        assert_eq!(ask_prompt(&req("edit", "edit")), "    allow edit? [y]es [n]o [a]lways (edit) › ");
+        assert_eq!(ask_prompt(&req("bash", "")), "    allow bash? [y]es [n]o [a]lways › ");
     }
 }

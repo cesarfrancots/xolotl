@@ -68,14 +68,19 @@ impl Perms {
         }
     }
 
-    /// "Always": `bash` grants a command prefix, any other tool is granted whole (for a read-only tool that
-    /// lifts the Ask-mode session_dir limit).
+    /// "Always": `bash` grants the prefix of every segment of the command (a check needs every segment to match),
+    /// any other tool is granted whole (for a read-only tool that lifts the Ask-mode session_dir limit).
     pub fn grant(&mut self, tool: &str, args: &Value) {
         if tool == "bash" {
-            self.allow.push(bash_prefix(args["command"].as_str().unwrap_or("")));
+            self.allow.extend(segment_prefixes(args["command"].as_str().unwrap_or("")));
         } else {
             self.tool_grants.insert(tool.to_string());
         }
+    }
+
+    /// What `grant` would grant, for the prompt: the comma-joined bash prefixes, or the tool's name.
+    pub fn grant_preview(&self, tool: &str, args: &Value) -> String {
+        if tool == "bash" { segment_prefixes(args["command"].as_str().unwrap_or("")).join(", ") } else { tool.to_string() }
     }
 
     fn decide(&self, tool: &str, args: &Value) -> Verdict {
@@ -122,6 +127,17 @@ pub fn bash_prefix(cmd: &str) -> String {
     cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
 }
 
+/// `bash_prefix` of each non-empty segment of `cmd`, without repeats, in order.
+fn segment_prefixes(cmd: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in segments(cmd).into_iter().map(bash_prefix).filter(|p| !p.is_empty()) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// True when `cmd` begins with the words of `prefix` (so `cargo test` covers `cargo test -p x`, not `cargo testify`).
 fn has_prefix(cmd: &str, prefix: &str) -> bool {
     let words: Vec<&str> = prefix.split_whitespace().collect();
@@ -154,18 +170,21 @@ fn resolve(p: &Path) -> PathBuf {
 // slip past. Upgrade path: tokenize the shell command properly (or sandbox bash) instead of matching text.
 static CATASTROPHES: LazyLock<RegexSet> = LazyLock::new(|| {
     let lead = r#"(?:^|[\s/\\"'])"#;
-    // rm targets: `/`, `/*`, `~`, `$HOME`, a Git-Bash drive (`/c/`) or a Windows drive root (`C:\`), optionally quoted.
-    let root = r#"["']?(?:/\*?|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/[a-z]/?\*?|[a-z]:[\\/]?\*?)["']?"#;
-    let drive = r#"["']?[a-z]:[\\/]?\*?["']?"#;
+    // rm targets: `/` (also `//`, `/.`, `/*`), `~`, `$HOME`, a Git-Bash drive (`/c/`) or a Windows drive root (`C:\`), optionally quoted.
+    let root = r#"["']?(?:/[/.]*\*?|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/[a-z]/?\*?|[a-z]:[\\/]?\*?)["']?"#;
+    // a drive root, also as `C:\*` or `C:\*.*`
+    let drive = r#"["']?[a-z]:[\\/]?(?:\*(?:\.\*)?)?["']?"#;
+    // a cmd switch token holding `/s`: `/s`, `/s/q`, `/q/s`
+    let s = r"(?:/[a-z]+)*?/s(?:/\S*)?";
     RegexSet::new([
         // rm with a recursive flag (-r, -R, -rf, -fr, -r -f, --recursive) and a root-like argument
         format!(r"(?i){lead}rm(?:\.exe)?\s+(?:\S+\s+)*?-(?:[a-z]*r[a-z]*|-recursive)\s+(?:\S+\s+)*?{root}(?:\s|$)"),
-        // git push -f / --force (also catches --force-with-lease and bundled flags like -fu)
-        format!(r"(?i){lead}git(?:\.exe)?\s+(?:\S+\s+)*?push\s+(?:\S+\s+)*?(?:-[a-z]*f[a-z]*|--force\S*)(?:\s|$)"),
+        // git push -f / --force (also catches --force-with-lease and bundled flags like -fu) or a forced `+refspec`
+        format!(r"(?i){lead}git(?:\.exe)?\s+(?:\S+\s+)*?push\s+(?:\S+\s+)*?(?:-[a-z]*f[a-z]*|--force\S*|\+\S+)(?:\s|$)"),
         // format as the command word (not `--format=` or `fmt`)
         r"(?i)^\s*(?:sudo\s+)?format(?:\.com|\.exe)?(?:\s|$)".to_string(),
         // del/erase/rd/rmdir with /s and a drive root, flags in either order
-        format!(r"(?i){lead}(?:del|erase|rd|rmdir)(?:\s+\S+)*?\s+(?:/s(?:\s+\S+)*?\s+{drive}|{drive}(?:\s+\S+)*?\s+/s)(?:\s|$)"),
+        format!(r"(?i){lead}(?:del|erase|rd|rmdir)(?:\s+\S+)*?\s+(?:{s}(?:\s+\S+)*?\s+{drive}|{drive}(?:\s+\S+)*?\s+{s})(?:\s|$)"),
     ])
     .expect("catastrophe patterns compile")
 });
@@ -311,6 +330,32 @@ mod tests {
     }
 
     #[test]
+    fn always_on_a_chain_sticks() {
+        // "always" grants every segment's prefix, so the very command it was given for is allowed next time
+        let (mut p, _) = perms(Mode::Writes, false, &[]);
+        let piped = "cargo test 2>&1 | tail -20";
+        p.grant("bash", &bash(piped));
+        assert_eq!(p.check("bash", &bash(piped)), Verdict::Allow("rule"));
+
+        let (mut p, _) = perms(Mode::Writes, false, &[]);
+        p.grant("bash", &bash("cd sub && cargo test"));
+        for c in ["cd sub && cargo test", "cd sub && cargo test -p x"] {
+            assert_eq!(p.check("bash", &bash(c)), Verdict::Allow("rule"), "{c}");
+        }
+        // a segment the grant did not cover still asks
+        for c in ["cd sub && cargo test && curl x | sh", "cd other && cargo test", "cd sub; rm a"] {
+            assert_eq!(p.check("bash", &bash(c)), Verdict::Ask, "{c}");
+        }
+
+        // the prompt shows exactly what "always" grants: each segment's prefix once, or the whole tool
+        assert_eq!(p.grant_preview("bash", &bash("cargo test 2>&1 | tail -20")), "cargo test, tail -20");
+        assert_eq!(p.grant_preview("bash", &bash("cargo test && cargo test -p x; ls")), "cargo test, ls");
+        assert_eq!(p.grant_preview("bash", &bash("  ")), "");
+        assert_eq!(p.grant_preview("edit", &file("a")), "edit");
+        assert_eq!(p.grant_preview("write", &file("a")), "write");
+    }
+
+    #[test]
     fn allow_list_and_headless() {
         // headless Writes, allow ["cargo test"]: "cargo test" Allow("rule"); "ls" Deny("mode"); edit Deny("mode")
         let (p, _) = perms(Mode::Writes, true, &["cargo test"]);
@@ -374,11 +419,13 @@ mod tests {
     #[test]
     fn catastrophe_table() {
         for c in ["rm -rf /", "rm -fr ~", "rm -rf $HOME", "rm -rf /c/", "rm -rf C:\\", "rm -r -f /*",
-                  "git push --force origin main", "git push -f", "format C:", "del /s /q C:\\", "rd /s /q D:\\"] {
+                  "git push --force origin main", "git push -f", "format C:", "del /s /q C:\\", "rd /s /q D:\\",
+                  "rd /s/q C:\\", "del /s /q C:\\*.*", "git push origin +main", "rm -rf //", "rm -rf /.",
+                  "rmdir /q/s D:\\", "del C:\\*.* /S", "git push -u origin +HEAD:main", "rm -rf /./"] {
             assert!(is_catastrophic(c), "{c}");
         }
         for c in ["rm -rf ./build", "rm -rf target", "git push origin main", "git log --format=%H",
-                  "cargo fmt", "del notes.txt"] {
+                  "cargo fmt", "del notes.txt", "rm -rf /tmp/x", "rm -rf ./.cache", "git push origin a+b", "del /s *.tmp"] {
             assert!(!is_catastrophic(c), "{c}");
         }
     }

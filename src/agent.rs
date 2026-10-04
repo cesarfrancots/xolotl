@@ -298,7 +298,7 @@ impl Agent<'_> {
             Verdict::Allow("mode") => None, // the mode's default for this tool: not a decision worth an event
             Verdict::Allow(by) => Some(("allow", by)),
             Verdict::Deny(by) => Some(("deny", by)),
-            Verdict::Ask => Some(match self.ui.ask(&permission_request(call, &args)) {
+            Verdict::Ask => Some(match self.ui.ask(&permission_request(call, &args, self.perms.grant_preview(&call.name, &args))) {
                 Decision::Allow => ("allow", "user"),
                 Decision::Deny => ("deny", "user"),
                 Decision::Always => {
@@ -391,8 +391,8 @@ fn failed(call: &ToolCall, msg: &str) -> Kind {
 }
 
 /// The summary is one clipped line, so `bash` shows the whole command as the detail (the user must see exactly
-/// what they approve), and `edit`/`write` show a diff.
-fn permission_request(call: &ToolCall, args: &Value) -> PermissionRequest {
+/// what they approve), and `edit`/`write` show a diff. `always` is what an "always" answer grants.
+fn permission_request(call: &ToolCall, args: &Value, always: String) -> PermissionRequest {
     let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("");
     let detail = match call.name.as_str() {
         "bash" => Some(s("command").to_string()),
@@ -400,7 +400,7 @@ fn permission_request(call: &ToolCall, args: &Value) -> PermissionRequest {
         "write" => Some(mini_diff("", s("content"), DIFF_LINES)),
         _ => None,
     };
-    PermissionRequest { tool: call.name.clone(), summary: tool_summary(call), detail }
+    PermissionRequest { tool: call.name.clone(), summary: tool_summary(call), detail, always }
 }
 
 #[cfg(test)]
@@ -730,6 +730,7 @@ mod tests {
         assert_eq!(ui.asks.len(), 1);
         let req = &ui.asks[0];
         assert_eq!((req.tool.as_str(), req.summary.as_str(), req.detail.as_deref()), ("edit", "a.txt", Some("- hello\n+ bye")));
+        assert_eq!(req.always, "edit");
         let p = |id: &str, d: &str, by: &str| (id.to_string(), d.to_string(), by.to_string());
         assert_eq!(permissions(&session.events), [p("c2", "always", "user"), p("c3", "allow", "rule")]);
     }
@@ -752,6 +753,8 @@ mod tests {
         assert_eq!(m.requests.len(), 2); // the loop went on
         // bash: the summary is the first line only, so the detail carries the whole command; write: a diff
         assert_eq!((ui.asks[0].summary.as_str(), ui.asks[0].detail.as_deref()), ("echo hi", Some("echo hi\nrm -rf x")));
+        assert_eq!(ui.asks[0].always, "echo hi, rm -rf"); // every line is a segment, so "always" would grant both
+        assert_eq!(ui.asks[1].always, "write");
         assert_eq!((ui.asks[1].summary.as_str(), ui.asks[1].detail.as_deref()), ("b.txt", Some("+ x\n+ y")));
     }
 
