@@ -70,7 +70,9 @@ class LogparseHidden(unittest.TestCase):
         lines = self.read_log()
         variant = [ln for i, ln in enumerate(reversed(lines)) if i % 3 != 0] + lines[:7]
         with tempfile.TemporaryDirectory() as tmp:
-            shutil.copy(os.path.join(ROOT, "summarize.py"), tmp)
+            # Copy the whole solution (summarize.py and any helper modules), but not the checks, git data or old outputs.
+            skip = {"verify", ".git", "access.log", "summary.json"}
+            shutil.copytree(ROOT, tmp, dirs_exist_ok=True, ignore=lambda src, names: skip & set(names) if src == ROOT else ())
             with open(os.path.join(tmp, "access.log"), "w", encoding="utf-8", newline="\n") as f:
                 f.write("\n".join(variant) + "\n")
             check(self, run_summarize(tmp), expected_summary(variant))
