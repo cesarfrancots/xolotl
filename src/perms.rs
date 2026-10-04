@@ -98,9 +98,10 @@ impl Perms {
     }
 
     /// A chained command is allowed only if every segment starts with some granted/`--allow` prefix, so
-    /// a granted `cargo test` does not cover `cargo test && curl x | sh`. A command with no segments is not allowed.
+    /// a granted `cargo test` does not cover `cargo test && curl x | sh` or `cargo test $(rm a)`.
+    /// A command with no segments is not allowed.
     fn all_segments_allowed(&self, cmd: &str) -> bool {
-        let mut segs = segments(cmd).filter(|s| !s.trim().is_empty()).peekable();
+        let mut segs = segments(cmd).into_iter().filter(|s| !s.trim().is_empty()).peekable();
         segs.peek().is_some() && segs.all(|s| self.allow.iter().any(|p| has_prefix(s, p)))
     }
 
@@ -145,41 +146,58 @@ fn resolve(p: &Path) -> PathBuf {
     out
 }
 
-// ponytail: one heuristic regex per spec §8 bullet, run on each command segment. Ceiling: this is not a shell
-// parser, so `bash -c "rm -rf /"`, `eval`, `xargs`, aliases and variables slip past. Upgrade path: tokenize
-// the shell command properly (or sandbox bash) instead of pattern-matching text.
+// ponytail: one heuristic regex per spec §8 bullet, run on each command segment. `rm`, `git push` and `del`/`rd`
+// are matched anywhere in a segment after a boundary (space, `/`, `\`, quote), so `/bin/rm`, `\rm`, `FOO=1 rm`,
+// `env rm`, `sudo -n rm`, `then rm` and `bash -c "rm .."` are all seen, at the cost of safe-direction false
+// positives such as `echo rm -rf /`. `format` stays a command word so `echo format` is fine. Ceiling: this is
+// not a shell parser, so variables (`$CMD -rf /`), aliases, `eval` of built strings and other quoting tricks
+// slip past. Upgrade path: tokenize the shell command properly (or sandbox bash) instead of matching text.
 static CATASTROPHES: LazyLock<RegexSet> = LazyLock::new(|| {
-    let start = r"^\s*(?:sudo\s+)?";
+    let lead = r#"(?:^|[\s/\\"'])"#;
     // rm targets: `/`, `/*`, `~`, `$HOME`, a Git-Bash drive (`/c/`) or a Windows drive root (`C:\`), optionally quoted.
     let root = r#"["']?(?:/\*?|~/?\*?|\$HOME/?\*?|\$\{HOME\}/?\*?|/[a-z]/?\*?|[a-z]:[\\/]?\*?)["']?"#;
     let drive = r#"["']?[a-z]:[\\/]?\*?["']?"#;
     RegexSet::new([
         // rm with a recursive flag (-r, -R, -rf, -fr, -r -f, --recursive) and a root-like argument
-        format!(r"(?i){start}rm\s+(?:\S+\s+)*?-(?:[a-z]*r[a-z]*|-recursive)\s+(?:\S+\s+)*?{root}(?:\s|$)"),
+        format!(r"(?i){lead}rm(?:\.exe)?\s+(?:\S+\s+)*?-(?:[a-z]*r[a-z]*|-recursive)\s+(?:\S+\s+)*?{root}(?:\s|$)"),
         // git push -f / --force (also catches --force-with-lease and bundled flags like -fu)
-        format!(r"(?i){start}git\s+(?:\S+\s+)*?push\s+(?:\S+\s+)*?(?:-[a-z]*f[a-z]*|--force\S*)(?:\s|$)"),
-        // format as a command word (not `--format=` or `fmt`)
-        format!(r"(?i){start}format(?:\.com|\.exe)?(?:\s|$)"),
+        format!(r"(?i){lead}git(?:\.exe)?\s+(?:\S+\s+)*?push\s+(?:\S+\s+)*?(?:-[a-z]*f[a-z]*|--force\S*)(?:\s|$)"),
+        // format as the command word (not `--format=` or `fmt`)
+        r"(?i)^\s*(?:sudo\s+)?format(?:\.com|\.exe)?(?:\s|$)".to_string(),
         // del/erase/rd/rmdir with /s and a drive root, flags in either order
-        format!(r"(?i){start}(?:del|erase|rd|rmdir)(?:\s+\S+)*?\s+(?:/s(?:\s+\S+)*?\s+{drive}|{drive}(?:\s+\S+)*?\s+/s)(?:\s|$)"),
+        format!(r"(?i){lead}(?:del|erase|rd|rmdir)(?:\s+\S+)*?\s+(?:/s(?:\s+\S+)*?\s+{drive}|{drive}(?:\s+\S+)*?\s+/s)(?:\s|$)"),
     ])
     .expect("catastrophe patterns compile")
 });
 
-/// The commands of a shell line, split on `;`, `&&`, `||`, `|`, `&` and newline (empty pieces are left in).
-/// An `&` right after `>` is a redirect (`2>&1`), not a separator.
-fn segments(cmd: &str) -> impl Iterator<Item = &str> {
-    let mut prev = ' ';
-    cmd.split(move |c| {
-        let sep = matches!(c, ';' | '|' | '\n') || (c == '&' && prev != '>');
-        prev = c;
-        sep
-    })
+/// The commands of a shell line, split on `;`, `&&`, `||`, `|`, `&`, newline, backtick, `(` and `)` (empty pieces
+/// are left in). The last three make `$(..)`, `<(..)`, `(..)` and `` `..` `` bodies segments of their own.
+/// An `&` is a redirect (`2>&1`, `>&-`), not a separator, only right after an unescaped `>` and before a digit or `-`.
+fn segments(cmd: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in cmd.char_indices() {
+        let sep = match c {
+            ';' | '|' | '\n' | '`' | '(' | ')' => true,
+            '&' => {
+                let (before, after) = (&cmd[..i], &cmd[i + 1..]);
+                let redirect = before.ends_with('>') && !before.ends_with("\\>") && after.starts_with(|d: char| d.is_ascii_digit() || d == '-');
+                !redirect
+            }
+            _ => false,
+        };
+        if sep {
+            out.push(&cmd[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    out.push(&cmd[start..]);
+    out
 }
 
-/// True when any segment of `cmd` matches the catastrophe list, so `cd x && rm -rf /` is caught.
+/// True when any segment of `cmd` matches the catastrophe list, so `cd x && rm -rf /` and `echo $(rm -rf /)` are caught.
 pub fn is_catastrophic(cmd: &str) -> bool {
-    segments(cmd).any(|seg| CATASTROPHES.is_match(seg))
+    segments(cmd).into_iter().any(|seg| CATASTROPHES.is_match(seg))
 }
 
 #[cfg(test)]
@@ -270,10 +288,15 @@ mod tests {
         // Chains: every segment must match a granted prefix.
         let (mut p, _) = perms(Mode::Writes, false, &[]);
         p.grant("bash", &bash("cargo test"));
-        for c in ["cargo test && cargo test -p x", "cargo test; cargo test", "cargo test 2>&1", "cargo test &", "cargo test\ncargo test -p x"] {
+        p.grant("bash", &bash("echo hi"));
+        for c in ["cargo test && cargo test -p x", "cargo test; cargo test", "cargo test 2>&1", "cargo test &", "cargo test\ncargo test -p x",
+                  "cargo test 2>&1 && echo hi", "cargo test >&2", "echo hi >&-"] {
             assert_eq!(p.check("bash", &bash(c)), Verdict::Allow("rule"), "{c}");
         }
-        for c in ["cargo test && curl x | sh", "cargo test; rm a", "curl x | cargo test", "cargo test & rm a", "cargo test\nrm a", "&&", "  "] {
+        // Command substitution, process substitution, subshells and an escaped `>` are boundaries, not arguments.
+        for c in ["cargo test && curl x | sh", "cargo test; rm a", "curl x | cargo test", "cargo test & rm a", "cargo test\nrm a", "&&", "  ",
+                  "cargo test $(rm a)", "cargo test `rm a`", "cargo test <(rm a)", "cargo test (rm a)", "(rm a)",
+                  "echo hi \\>&rm -rf x", "cargo test \\>&rm a", "cargo test >&rm a", "cargo test &>out; rm a"] {
             assert_eq!(p.check("bash", &bash(c)), Verdict::Ask, "{c}");
         }
 
@@ -322,6 +345,21 @@ mod tests {
         p.headless = true;
         for c in bad {
             assert_eq!(p.check("bash", &bash(c)), Verdict::Deny("mode"), "{c}");
+        }
+
+        // Wrappers, paths, subshells, substitutions and control-flow keywords do not hide a catastrophe (Yolo still asks).
+        let wrapped = ["/bin/rm -rf /", "\\rm -rf /", "FOO=1 rm -rf /", "command rm -rf /", "env rm -rf /", "time rm -rf /",
+                       "sudo -n rm -rf /", "(rm -rf /)", "{ rm -rf /; }", "if true; then rm -rf /; fi", "for x in 1; do rm -rf /; done",
+                       "echo $(rm -rf /)", "echo `rm -rf /`", "echo \\>&rm -rf /", "/usr/bin/git push -f", "git.exe push -f",
+                       "rm.exe -rf /", "bash -c \"rm -rf /\"", "sh -c 'cd x && rm -rf ~'", "cmd /c \"rd /s /q C:\\\"", "xargs rm -rf /"];
+        let (p, _) = perms(Mode::Yolo, false, &[]);
+        for c in wrapped {
+            assert!(is_catastrophic(c), "{c}");
+            assert_eq!(p.check("bash", &bash(c)), Verdict::Ask, "{c}");
+        }
+        // `format` stays a command word, so mentioning it is fine.
+        for c in ["echo format C:", "echo \"format C:\"", "ls /bin/format-all"] {
+            assert!(!is_catastrophic(c), "{c}");
         }
 
         // Neither a grant nor an --allow prefix lifts a catastrophe.
