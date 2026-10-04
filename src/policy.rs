@@ -433,7 +433,7 @@ fn without_toc(summary: &str) -> &str {
     let mut at = 0;
     for line in summary.split_inclusive('\n') {
         if line.get(..20).is_some_and(|h| h.eq_ignore_ascii_case("## table of contents")) {
-            return summary[..at].trim_end();
+            return clip(summary, at).trim_end();
         }
         at += line.len();
     }

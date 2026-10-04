@@ -509,6 +509,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
                 && session_unwritable(&e)
             {
                 unwritable = true;
+                term.notice(&e); // the agent shows no notice for a failed write
                 term.notice(UNWRITABLE);
             }
             continue;
