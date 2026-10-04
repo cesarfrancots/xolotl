@@ -80,11 +80,66 @@ fn cut(l: &str) -> String {
     if l.len() > LINE_MAX { format!("{}…", clip(l, LINE_MAX)) } else { l.to_string() }
 }
 
+/// End of a CSI sequence whose parameters start at `cs[i]`: past the final byte, or at the first byte that
+/// cannot belong to it.
+fn skip_csi(cs: &[char], mut i: usize) -> usize {
+    while let Some(&c) = cs.get(i) {
+        match c {
+            ' '..='?' => i += 1,       // parameter and intermediate bytes
+            '@'..='~' => return i + 1, // final byte
+            _ => return i,
+        }
+    }
+    i
+}
+
+/// End of an OSC string whose payload starts at `cs[i]`: past BEL or `ESC \`. An ESC that is not part of `ESC \`
+/// is left for the caller, as it starts a new sequence.
+fn skip_osc(cs: &[char], mut i: usize) -> usize {
+    while let Some(&c) = cs.get(i) {
+        match c {
+            '\x07' => return i + 1,
+            '\x1b' => return if cs.get(i + 1) == Some(&'\\') { i + 2 } else { i },
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Text that is safe to print: model and tool output must not be able to move the cursor, clear or recolor the
+/// screen, or retitle the window, because a prompt has to show what will actually run. Strips ANSI escape
+/// sequences (CSI, OSC, any other `ESC x`, and the 8-bit CSI), drops `\r`, and turns every other control
+/// character except `\n` and `\t` into `·`. A sequence split across two streamed chunks loses its ESC, so the
+/// rest of it prints as harmless text.
+fn sanitize(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        i += 1;
+        match c {
+            '\x1b' => match cs.get(i) {
+                Some('[') => i = skip_csi(&cs, i + 1),
+                Some(']') => i = skip_osc(&cs, i + 1),
+                Some(_) => i += 1,
+                None => {}
+            },
+            '\u{9b}' => i = skip_csi(&cs, i),
+            '\r' => {}
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => out.push('·'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A short description of the call's arguments for the tool line and the permission prompt. Paths are never
 /// cut: the end of a path is what a person approving an edit needs to see. Unparseable or unexpected args fall
 /// back to the first line of the raw text.
 pub fn tool_summary(call: &ToolCall) -> String {
-    let Ok(a) = serde_json::from_str::<Value>(&call.args) else { return first_line(&call.args) };
+    let a = serde_json::from_str::<Value>(&call.args).unwrap_or(Value::Null); // Null: every lookup misses, so the fallback applies
     let s = |k: &str| a.get(k).and_then(Value::as_str);
     let n = |k: &str| a.get(k).and_then(Value::as_u64);
     let found = match call.name.as_str() {
@@ -103,7 +158,9 @@ pub fn tool_summary(call: &ToolCall) -> String {
         "todo" => a.get("items").and_then(Value::as_array).map(|i| plural(i.len(), "item")),
         _ => None,
     };
-    found.unwrap_or_else(|| first_line(&call.args))
+    // one line, however the model wrote the arguments (a lone `\r` would otherwise survive `first_line`)
+    let one_line = |s: String| s.split(['\r', '\n']).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(" ");
+    one_line(found.unwrap_or_else(|| first_line(&call.args)))
 }
 
 /// `- ` lines for `old`, then `+ ` lines for `new`; after `max_lines` lines, `… (N more)`.
@@ -201,7 +258,7 @@ impl<W: Write> Ui for Headless<W> {
         }
     }
     fn notice(&mut self, msg: &str) {
-        eprintln!("{msg}");
+        let _ = writeln!(io::stderr(), "{msg}"); // a closed stderr must not abort the run
     }
     fn status(&mut self, _: &Status) {}
 }
@@ -298,7 +355,11 @@ impl Terminal {
         Terminal { show_thinking, cancel, tty: io::stdout().is_terminal(), line: Line::Bol }
     }
 
+    /// Everything printed to the user goes through here, and through `sanitize`. Only this type's own escape
+    /// codes (styles, the thinking-line redraw) reach the terminal unfiltered.
     fn put(&mut self, s: &str, sty: Sty) {
+        let s = sanitize(s);
+        let s = s.as_str();
         if s.is_empty() {
             return;
         }
@@ -500,6 +561,40 @@ mod tests {
         assert_eq!(tool_summary(&call("read", "{bad")), "{bad");
         assert_eq!(tool_summary(&call("bash", "{}")), "{}");
         assert_eq!(summary("frob", json!({ "a": 1 })), r#"{"a":1}"#);
+
+        // a tool line stays one line, whatever the model put in the arguments
+        assert_eq!(summary("edit", json!({ "path": "a\nb" })), "a b");
+        assert_eq!(summary("edit", json!({ "path": "a\r\nb\rc" })), "a b c");
+        assert_eq!(summary("bash", json!({ "command": "ls\rrm -rf x" })), "ls rm -rf x");
+        assert_eq!(tool_summary(&call("read", "{bad\rmore")), "{bad more");
+    }
+
+    #[test]
+    fn sanitize_strips_terminal_control() {
+        assert_eq!(sanitize("a\x1b[2K\rb"), "ab");
+        assert_eq!(sanitize("x\x1b]0;title\x07y"), "xy");
+        assert_eq!(sanitize("x\x1b]0;title\x1b\\y"), "xy");
+        assert_eq!(sanitize("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(sanitize("a\x1b[1;38;5;196mb\x1b[?25lc"), "abc");
+        assert_eq!(sanitize("a\u{9b}31mb"), "ab"); // 8-bit C1 CSI
+        assert_eq!(sanitize("a\x1bcb"), "ab"); // two-byte ESC x
+        assert_eq!(sanitize("a\x08b\x00c"), "a·b·c");
+        assert_eq!(sanitize("a\u{85}b\x7fc"), "a·b·c");
+        assert_eq!(sanitize("keep\n\ttabs é✓"), "keep\n\ttabs é✓");
+        // unterminated sequences are dropped, and never panic
+        assert_eq!(sanitize("a\x1b["), "a");
+        assert_eq!(sanitize("a\x1b[31"), "a");
+        assert_eq!(sanitize("a\x1b]0;never ends"), "a");
+        assert_eq!(sanitize("a\x1b"), "a");
+        // a malformed sequence stops at the first byte that cannot belong to it
+        assert_eq!(sanitize("a\x1b[\x1b[31mb"), "ab");
+        assert_eq!(sanitize("a\x1b[3\nb"), "a\nb");
+        // an escape inside an OSC that is not ST starts a new sequence
+        assert_eq!(sanitize("a\x1b]0;t\x1b[31mb"), "ab");
+        // nothing that survives can be interpreted by a terminal
+        let nasty: String = (0u32..0x200).filter_map(char::from_u32).collect();
+        let clean = sanitize(&nasty);
+        assert!(clean.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'), "{clean:?}");
     }
 
     #[test]
