@@ -4,6 +4,7 @@
 use crate::llm::Message;
 use crate::store::{Event, Kind};
 use crate::tools::{Shell, clip, clip_tail};
+use serde_json::Value;
 use std::path::Path;
 
 pub struct Limits {
@@ -149,20 +150,29 @@ pub fn build_view(events: &[Event]) -> Vec<Message> {
     if let Some(system) = events.iter().find_map(|e| if let Kind::SessionStart { system, .. } = &e.kind { Some(system) } else { None }) {
         view.push(Message::System(system.clone()));
     }
-    let stage2 = events.iter().rev().find_map(|e| match &e.kind {
-        Kind::Compaction { stage: 2, to_seq: Some(to), summary: Some(summary), .. } => Some((*to, summary)),
-        _ => None,
-    });
-    let after = stage2.map_or(0, |(to, summary)| {
-        view.push(Message::User(summary.clone()));
+    let after = latest_stage2(events).map_or(0, |(to, summary)| {
+        view.push(Message::User(summary.to_string()));
         to
     });
-    let stage1 = events.iter().rev().find_map(|e| match &e.kind {
+    view.extend(render(events, after, stage1_upto(events, after)));
+    merge_users(view) // a cut before a user event leaves the summary next to a User: one turn, not two
+}
+
+/// `(to_seq, summary)` of the latest stage-2 compaction.
+fn latest_stage2(events: &[Event]) -> Option<(u64, &str)> {
+    events.iter().rev().find_map(|e| match &e.kind {
+        Kind::Compaction { stage: 2, to_seq: Some(to), summary: Some(summary), .. } => Some((*to, summary.as_str())),
+        _ => None,
+    })
+}
+
+/// The stage-1 cutoff in force for a view that starts after `after_seq`: the latest one, unless the summary already covers it (then 0).
+fn stage1_upto(events: &[Event], after_seq: u64) -> u64 {
+    let latest = events.iter().rev().find_map(|e| match &e.kind {
         Kind::Compaction { stage: 1, upto_seq: Some(upto), .. } => Some(*upto),
         _ => None,
     });
-    view.extend(render(events, after, stage1.filter(|&u| u > after).unwrap_or(0)));
-    merge_users(view) // a cut before a user event leaves the summary next to a User: one turn, not two
+    latest.filter(|&u| u > after_seq).unwrap_or(0)
 }
 
 /// Events with `seq > after_seq` as messages; tool results with `seq <= stub_upto` (except `todo`) become stubs.
@@ -236,6 +246,198 @@ fn merge_users(msgs: Vec<Message>) -> Vec<Message> {
     out
 }
 
+// ---- size, compaction triggers, cut and summary layout (spec §10.2–10.4) ----
+
+#[derive(Debug, PartialEq)]
+pub enum Compaction {
+    /// Shrink tool results at or before `upto_seq` to stubs (no LLM call).
+    Stage1 { upto_seq: u64 },
+    Stage2,
+}
+
+/// Events `from_seq..=to_seq` are replaced by a summary. `mid_turn`: the cut falls inside a user turn, just before an assistant event.
+#[derive(Debug, PartialEq)]
+pub struct Cut {
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub mid_turn: bool,
+}
+
+/// `chars / 3`; deliberately over-counts code (spec §10.2).
+fn tokens_of(msgs: impl IntoIterator<Item = Message>) -> usize {
+    msgs.into_iter().map(|m| m.chars()).sum::<usize>() / 3
+}
+
+/// The last response's `prompt + completion` tokens plus `chars / 3` of what came after it. A compaction after that
+/// response makes its usage stale, so then it is `chars / 3` of the whole view.
+pub fn estimate_tokens(events: &[Event]) -> usize {
+    let last_assistant = events.iter().enumerate().rev().find_map(|(i, e)| match &e.kind {
+        Kind::Assistant { usage, .. } => Some((i, usage)),
+        _ => None,
+    });
+    let last_compaction = events.iter().rposition(|e| matches!(e.kind, Kind::Compaction { .. }));
+    match last_assistant {
+        // Per event, not `render`: its pairing would drop, as orphans, the results of that response's own tool calls.
+        Some((i, usage)) if last_compaction.is_none_or(|c| c < i) => {
+            (usage.prompt + usage.completion) as usize + tokens_of(events[i + 1..].iter().filter_map(|e| to_message(e, 0)))
+        }
+        _ => tokens_of(build_view(events)),
+    }
+}
+
+pub fn compaction_needed(prompt_tokens: usize, budget: usize, events: &[Event]) -> Option<Compaction> {
+    let pct = prompt_tokens * 100 / budget.max(1);
+    // Stage 1 just ran and the very next response is still big: shrinking again will not help.
+    let stage1_just_ran = events.iter().rposition(|e| matches!(e.kind, Kind::Compaction { .. })).is_some_and(|i| {
+        matches!(events[i].kind, Kind::Compaction { stage: 1, .. }) && events[i + 1..].iter().filter(|e| matches!(e.kind, Kind::Assistant { .. })).count() == 1
+    });
+    if pct >= LIMITS.stage2_pct || (pct >= LIMITS.stage1_pct && stage1_just_ran) {
+        return Some(Compaction::Stage2);
+    }
+    if pct < LIMITS.stage1_pct {
+        return None;
+    }
+    let after = latest_stage2(events).map_or(0, |(to, _)| to);
+    let results: Vec<u64> = events.iter().filter(|e| e.seq > after && matches!(e.kind, Kind::ToolResult { .. })).map(|e| e.seq).collect();
+    // the newest `keep_recent_results` stay verbatim; the one before them is the cutoff
+    Some(match results.len().checked_sub(LIMITS.keep_recent_results + 1) {
+        Some(i) if results[i] > stage1_upto(events, after) => Compaction::Stage1 { upto_seq: results[i] },
+        _ => Compaction::Stage2, // too few results to shrink, or shrinking would change nothing
+    })
+}
+
+/// Where stage 2 cuts the history (spec §10.4 step 1); `None` when there is nothing worth compacting.
+pub fn stage2_cut(events: &[Event], budget: usize) -> Option<Cut> {
+    let after = latest_stage2(events).map_or(0, |(to, _)| to);
+    let from_seq = after + 1;
+    let stub = stage1_upto(events, after);
+    // ponytail: re-renders the kept tail for every candidate: O(assistants after the last user × history). Upgrade path: prefix sums of per-event chars.
+    let fits = |c: u64, pct: usize| tokens_of(render(events, c, stub)) * 100 <= budget * pct;
+    // a cut only counts if it swallows a user or assistant event (else the "summary" would cover nothing)
+    let valid = |c: u64| events.iter().any(|e| (from_seq..=c).contains(&e.seq) && matches!(e.kind, Kind::User { .. } | Kind::Assistant { .. }));
+    let cut = |to_seq, mid_turn| Cut { from_seq, to_seq, mid_turn };
+
+    let users: Vec<u64> = events.iter().filter(|e| matches!(e.kind, Kind::User { .. })).map(|e| e.seq).collect();
+    let n = users.len();
+    // A: just before the second-to-last user event, B: just before the last one
+    let ab = [n.checked_sub(2), n.checked_sub(1)].into_iter().flatten().map(|i| users[i].saturating_sub(1));
+    if let Some(c) = ab.into_iter().find(|&c| valid(c) && fits(c, LIMITS.cut_keep_pct)) {
+        return Some(cut(c, false));
+    }
+    // C: mid-turn, just before an assistant event after the last user: the earliest that fits, else the last
+    let last_user = users.last().copied().unwrap_or(0);
+    let before_assistant: Vec<u64> = events
+        .iter()
+        .filter(|e| e.seq > last_user && matches!(e.kind, Kind::Assistant { .. }))
+        .map(|e| e.seq.saturating_sub(1))
+        .filter(|&c| valid(c))
+        .collect();
+    let c = before_assistant.iter().copied().find(|&c| fits(c, LIMITS.cut_mid_pct)).or(before_assistant.last().copied())?;
+    Some(cut(c, true))
+}
+
+pub fn summary_prompt(focus: Option<&str>) -> String {
+    let mut p = String::from(
+        "Summarize this session so work can continue from your summary alone. The raw history stays on disk, so write what someone continuing the work needs. Use exactly these sections:
+## Goal
+## Current state
+## Decisions and why
+## Files touched
+## Failed attempts and why they failed
+## Open TODOs and next step
+Be specific: file paths, function names, commands, exact error messages. Do not call tools.",
+    );
+    if let Some(f) = focus {
+        p.push_str("\nFocus: ");
+        p.push_str(f);
+    }
+    p
+}
+
+/// Built by the harness from the events it is given, so the pointers into `events.jsonl` can't be hallucinated.
+pub fn table_of_contents(events: &[Event], session_dir: &Path) -> String {
+    let list = |lines: Vec<String>| if lines.is_empty() { "(none)".to_string() } else { lines.join("\n") };
+    let users: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::User { text } => Some(format!("- seq {}: {}", e.seq, clip(text, LIMITS.toc_user_chars))),
+            _ => None,
+        })
+        .collect();
+    let files: Vec<String> = changed_files(events)
+        .into_iter()
+        .map(|(path, seqs)| format!("- {path} — seq {}", seqs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")))
+        .collect();
+    let saved: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            Kind::ToolResult { artifact: Some(a), .. } => Some(format!("- {a} — seq {}", e.seq)),
+            _ => None,
+        })
+        .collect();
+    let todo: Vec<String> = latest_todo(events).into_iter().collect();
+    format!(
+        "## Table of contents (generated by Xolotl)\nRaw history: {}/events.jsonl\n\n### User messages\n{}\n\n### Files changed\n{}\n\n### Saved outputs\n{}\n\n### Todo\n{}",
+        session_dir.display(),
+        list(users),
+        list(files),
+        list(saved),
+        list(todo)
+    )
+}
+
+/// The message that replaces events `cut.from_seq..=cut.to_seq` in the view. The table of contents covers everything up to
+/// `to_seq` (not only this range), because only the latest summary is shown.
+pub fn summary_message(summary: &str, cut: &Cut, events: &[Event], session_dir: &Path) -> String {
+    let covered = &events[..events.partition_point(|e| e.seq <= cut.to_seq)];
+    let mut msg = format!(
+        "[Session summary — events {}–{} compacted. Raw history: {}/events.jsonl (line = seq); read/grep it for exact details.]\n\n{summary}\n\n{}",
+        cut.from_seq,
+        cut.to_seq,
+        session_dir.display(),
+        table_of_contents(covered, session_dir)
+    );
+    // a mid-turn cut would otherwise leave the model without its task
+    if cut.mid_turn
+        && let Some(request) = covered.iter().rev().find_map(|e| if let Kind::User { text } = &e.kind { Some(text) } else { None })
+    {
+        msg.push_str("\n\n## Current request (verbatim)\n");
+        msg.push_str(request);
+    }
+    msg
+}
+
+/// Files a successful `edit`/`write` changed, in order of first change, with the seq of every change.
+fn changed_files(events: &[Event]) -> Vec<(String, Vec<u64>)> {
+    let mut files: Vec<(String, Vec<u64>)> = Vec::new();
+    for (i, e) in events.iter().enumerate() {
+        let Kind::ToolResult { call_id, name, ok: true, .. } = &e.kind else { continue };
+        if name != "edit" && name != "write" {
+            continue;
+        }
+        let call = events[..i].iter().rev().find_map(|p| match &p.kind {
+            Kind::Assistant { tool_calls, .. } => tool_calls.iter().find(|c| c.id == *call_id),
+            _ => None,
+        });
+        let path = call.and_then(|c| serde_json::from_str::<Value>(&c.args).ok()).and_then(|a| a.get("path")?.as_str().map(String::from));
+        let Some(path) = path else { continue };
+        match files.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, seqs)) => seqs.push(e.seq),
+            None => files.push((path, vec![e.seq])),
+        }
+    }
+    files
+}
+
+/// The list as the latest valid `todo` call left it, rendered by the tool itself (a call it rejects changed nothing).
+fn latest_todo(events: &[Event]) -> Option<String> {
+    let calls = events.iter().rev().filter_map(|e| if let Kind::Assistant { tool_calls, .. } = &e.kind { Some(tool_calls) } else { None });
+    calls.flat_map(|calls| calls.iter().rev()).filter(|c| c.name == "todo").find_map(|c| {
+        let out = crate::tools::todo(&serde_json::from_str::<Value>(&c.args).ok()?);
+        out.ok.then_some(out.text)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +480,38 @@ mod tests {
     }
     fn asst_msg(text: &str, reasoning: Option<&str>, tool_calls: Vec<ToolCall>) -> Message {
         Message::Assistant { text: text.into(), reasoning: reasoning.map(Into::into), tool_calls }
+    }
+    /// Numbers the kinds 1, 2, 3, … (a seq is a 1-based line number).
+    fn evs(kinds: Vec<Kind>) -> Vec<Event> {
+        kinds.into_iter().enumerate().map(|(i, k)| ev(i as u64 + 1, k)).collect()
+    }
+    /// `n` assistant events without tool calls, `len` chars of text each.
+    fn plain(n: usize, len: usize) -> Vec<Kind> {
+        (0..n).map(|_| asst(&"a".repeat(len), "")).collect()
+    }
+    /// `n` × (assistant calling bash, its result of `len` bytes); call ids are `{prefix}0`, `{prefix}1`, …
+    fn pairs(prefix: &str, n: usize, len: usize) -> Vec<Kind> {
+        (0..n)
+            .flat_map(|i| {
+                let id = format!("{prefix}{i}");
+                [asst_calls(&[(id.as_str(), "bash", "{}")]), result(&id, "bash", &"r".repeat(len))]
+            })
+            .collect()
+    }
+    fn with_usage(mut k: Kind, prompt: u64, completion: u64) -> Kind {
+        if let Kind::Assistant { usage, .. } = &mut k {
+            *usage = Usage { prompt, completion, cached: 0 };
+        }
+        k
+    }
+    fn failed(mut k: Kind) -> Kind {
+        if let Kind::ToolResult { ok, .. } = &mut k {
+            *ok = false;
+        }
+        k
+    }
+    fn result_seqs(events: &[Event]) -> Vec<u64> {
+        events.iter().filter(|e| matches!(e.kind, Kind::ToolResult { .. })).map(|e| e.seq).collect()
     }
 
     #[test]
@@ -523,5 +757,232 @@ mod tests {
         let events = vec![ev(1, asst("x", "r")), ev(2, asst("y", ""))];
         let want = if RESEND_REASONING { Some("r") } else { None };
         assert_eq!(render(&events, 0, 0), vec![asst_msg("x", want, vec![]), asst_msg("y", None, vec![])]);
+    }
+
+    // ---- size, triggers, cut, summary layout (Task 9) ----
+
+    #[test]
+    fn estimate_uses_usage_then_chars() {
+        let head = || vec![session_start(&"s".repeat(60)), user(&"u".repeat(60))];
+        let call = || with_usage(asst_calls(&[("c1", "bash", "{}")]), 1000, 200);
+        let out = || result("c1", "bash", &"r".repeat(300));
+
+        // the last response's usage, plus chars/3 of what came after it (the 300-byte result, even though its call is not in the tail)
+        let events = evs([head(), vec![call(), out()]].concat());
+        assert_eq!(estimate_tokens(&events), 1000 + 200 + 100);
+
+        // a compaction after that response makes its usage stale: chars of the whole view / 3
+        // (system 60 + user 60 + the call "bash" + "{}" = 6 + result 300 = 426)
+        let events = evs([head(), vec![call(), compaction(1, Some(1), None, None), out()]].concat());
+        assert_eq!(estimate_tokens(&events), 426 / 3);
+        assert_eq!(estimate_tokens(&events), build_view(&events).iter().map(Message::chars).sum::<usize>() / 3);
+
+        // a compaction before the response does not make its usage stale
+        let events = evs([head(), vec![compaction(1, Some(1), None, None), call(), out()]].concat());
+        assert_eq!(estimate_tokens(&events), 1000 + 200 + 100);
+
+        // no response yet: the view
+        assert_eq!(estimate_tokens(&evs(head())), 120 / 3);
+    }
+
+    #[test]
+    fn triggers() {
+        let base = |n: usize| evs([vec![session_start("S"), user("go")], pairs("a", n, 10)].concat()); // results at seq 4, 6, 8, …
+        let twelve = base(12);
+        let r = result_seqs(&twelve);
+        assert_eq!(r[1], 6);
+
+        assert_eq!(compaction_needed(500, 1000, &twelve), None);
+        assert_eq!(compaction_needed(900, 1000, &twelve), Some(Compaction::Stage2));
+        // 60% with 12 results: shrink everything up to the 11th-most-recent
+        assert_eq!(compaction_needed(650, 1000, &twelve), Some(Compaction::Stage1 { upto_seq: 6 }));
+        // exactly 11 results is enough (the oldest one); 10 is not
+        assert_eq!(compaction_needed(650, 1000, &base(11)), Some(Compaction::Stage1 { upto_seq: 4 }));
+        assert_eq!(compaction_needed(650, 1000, &base(10)), Some(Compaction::Stage2));
+        assert_eq!(compaction_needed(650, 1000, &base(5)), Some(Compaction::Stage2));
+
+        // the thresholds are inclusive: 60% and 85% trigger, one below does not
+        assert_eq!(compaction_needed(599, 1000, &twelve), None);
+        assert_eq!(compaction_needed(600, 1000, &twelve), Some(Compaction::Stage1 { upto_seq: 6 }));
+        assert_eq!(compaction_needed(849, 1000, &twelve), Some(Compaction::Stage1 { upto_seq: 6 }));
+        assert_eq!(compaction_needed(850, 1000, &twelve), Some(Compaction::Stage2));
+
+        // only results after the latest stage-2 range count: 8 old ones (seq 4..=18 are covered by the summary), then n new ones
+        let after_summary = |n: usize| {
+            evs([vec![session_start("S"), user("go")], pairs("a", 8, 10), vec![compaction(2, None, Some(18), Some("SUM"))], pairs("b", n, 10)].concat())
+        };
+        assert_eq!(compaction_needed(650, 1000, &after_summary(5)), Some(Compaction::Stage2)); // 13 results in all, only 5 after seq 18
+        assert_eq!(compaction_needed(650, 1000, &after_summary(12)), Some(Compaction::Stage1 { upto_seq: 23 })); // 2nd new result
+    }
+
+    #[test]
+    fn stage1_then_still_high_goes_stage2() {
+        let head = [vec![session_start("S"), user("go")], pairs("a", 12, 10)].concat(); // results at 4..=26; a fresh stage 1 would cut at seq 6
+
+        // stage 1 (at an old, lower cutoff) just ran and the very next response is still ≥ 60%: Stage 2, although a larger cutoff exists
+        let a = evs([head.clone(), vec![compaction(1, Some(4), None, None), asst("ok", "")]].concat());
+        assert_eq!(compaction_needed(650, 1000, &a), Some(Compaction::Stage2));
+        assert_eq!(compaction_needed(500, 1000, &a), None);
+        // control: no response since that stage 1, so the ordinary rule applies
+        let control = evs([head.clone(), vec![compaction(1, Some(4), None, None)]].concat());
+        assert_eq!(compaction_needed(650, 1000, &control), Some(Compaction::Stage1 { upto_seq: 6 }));
+        // the rule is about stage 1: right after a stage 2, a first response at 65% still gets the ordinary Stage 1
+        let d = evs([head.clone(), vec![compaction(2, None, Some(2), Some("SUM")), asst("ok", "")]].concat());
+        assert_eq!(compaction_needed(650, 1000, &d), Some(Compaction::Stage1 { upto_seq: 6 }));
+
+        // …Compaction{stage:1}, Assistant, Assistant, then 11 more results: it is no longer the first response, and the new cutoff is larger
+        let b = evs([head.clone(), vec![compaction(1, Some(6), None, None), asst("1", ""), asst("2", "")], pairs("b", 11, 10)].concat());
+        let r = result_seqs(&b);
+        let upto = r[r.len() - 11];
+        assert!(upto > 6);
+        assert_eq!(compaction_needed(650, 1000, &b), Some(Compaction::Stage1 { upto_seq: upto }));
+
+        // a new cutoff that does not move past the current one would change nothing: Stage 2
+        for current in [6, 8] {
+            let c = evs([head.clone(), vec![compaction(1, Some(current), None, None), asst("1", ""), asst("2", "")]].concat());
+            assert_eq!(compaction_needed(650, 1000, &c), Some(Compaction::Stage2), "current cutoff {current}");
+        }
+    }
+
+    #[test]
+    fn stage2_cut_prefers_two_user_turns() {
+        // users at seq 2, 10, 20; everything is tiny against the budget
+        let kinds = [vec![session_start("S"), user("u1")], plain(7, 10), vec![user("u2")], plain(9, 10), vec![user("u3")], plain(1, 10)].concat();
+        let events = evs(kinds);
+        assert_eq!(events[9].seq, 10);
+        assert!(matches!(events[9].kind, Kind::User { .. }) && matches!(events[19].kind, Kind::User { .. }));
+        assert_eq!(stage2_cut(&events, 100_000), Some(Cut { from_seq: 1, to_seq: 9, mid_turn: false }));
+
+        // after an earlier stage-2 range ending at seq 5 the cut starts at 6
+        let mut later = events.clone();
+        later.push(ev(22, compaction(2, None, Some(5), Some("SUM"))));
+        assert_eq!(stage2_cut(&later, 100_000), Some(Cut { from_seq: 6, to_seq: 9, mid_turn: false }));
+    }
+
+    #[test]
+    fn stage2_cut_falls_back_to_last_user() {
+        // users at 2, 10, 20. The turn at 10..=19 is big (9 × 400 chars), so keeping from seq 10 on would be over 40% of 1000 tokens (400);
+        // keeping from seq 20 on (about 100 chars) is not.
+        let kinds = [vec![session_start("S"), user("u1")], plain(7, 10), vec![user("u2")], plain(9, 400), vec![user("u3")], plain(1, 100)].concat();
+        let events = evs(kinds);
+        assert!(render(&events, 9, 0).iter().map(Message::chars).sum::<usize>() / 3 > 400);
+        assert!(render(&events, 19, 0).iter().map(Message::chars).sum::<usize>() / 3 <= 400);
+        assert_eq!(stage2_cut(&events, 1000), Some(Cut { from_seq: 1, to_seq: 19, mid_turn: false }));
+    }
+
+    #[test]
+    fn stage2_cut_measures_the_tail_with_stage1_stubs() {
+        // users at 2, 10, 20; the turn at 10..=19 holds three 3_000-byte results; 40% of 4_000 tokens is 4_800 chars
+        let kinds = [vec![session_start("S"), user("u1")], plain(7, 10), vec![user("u2")], pairs("p", 3, 3_000), plain(3, 10), vec![user("u3")], plain(1, 10)].concat();
+        let events = evs(kinds);
+        assert_eq!(result_seqs(&events), [12, 14, 16]);
+        // verbatim, keeping seq 10 on is too much, so the cut falls back to just before the last user
+        assert_eq!(stage2_cut(&events, 4_000), Some(Cut { from_seq: 1, to_seq: 19, mid_turn: false }));
+        // with those results stubbed (as the view will show them) it fits
+        let mut stubbed = events.clone();
+        stubbed.push(ev(22, compaction(1, Some(16), None, None)));
+        assert_eq!(stage2_cut(&stubbed, 4_000), Some(Cut { from_seq: 1, to_seq: 9, mid_turn: false }));
+    }
+
+    #[test]
+    fn stage2_cut_mid_turn_single_long_request() {
+        // start, one user request, then 40 × (assistant call, 3_000-byte result): the assistants are at seq 3, 5, …, 81
+        let events = evs([vec![session_start("S"), user("do everything")], pairs("c", 40, 3_000)].concat());
+        let cut = stage2_cut(&events, 30_000).unwrap();
+        assert!(cut.mid_turn);
+        assert_eq!(cut.from_seq, 1);
+        assert!(matches!(events[cut.to_seq as usize].kind, Kind::Assistant { .. })); // the event at to_seq + 1
+        assert!(render(&events, cut.to_seq, 0).iter().map(Message::chars).sum::<usize>() / 3 <= 6_000); // 20% of the budget
+        // the earliest qualifying assistant: each pair is 3_006 chars, 5 pairs ≈ 5_010 tokens fit in 6_000, 6 pairs ≈ 6_012 do not
+        assert_eq!(cut, Cut { from_seq: 1, to_seq: 72, mid_turn: true });
+
+        // nothing fits in 20% of the budget: the last assistant (seq 81)
+        assert_eq!(stage2_cut(&events, 1_000), Some(Cut { from_seq: 1, to_seq: 80, mid_turn: true }));
+    }
+
+    #[test]
+    fn stage2_cut_nothing_to_compact() {
+        // B would be seq 1, which covers only SessionStart: not a valid cut
+        assert_eq!(stage2_cut(&evs(vec![session_start("S"), user("hi")]), 100_000), None);
+        // nothing left after an earlier summary that covers the whole history so far
+        let covered = evs(vec![session_start("S"), user("hi"), asst("a", ""), compaction(2, None, Some(3), Some("SUM"))]);
+        assert_eq!(stage2_cut(&covered, 100_000), None);
+        // a cut only has to be valid on its own: A (seq 1) is not, B (seq 2) is
+        let two_users = evs(vec![session_start("S"), user("a"), user("b"), asst("c", "")]);
+        assert_eq!(stage2_cut(&two_users, 100_000), Some(Cut { from_seq: 1, to_seq: 2, mid_turn: false }));
+    }
+
+    #[test]
+    fn toc_and_summary_message() {
+        let long = "a".repeat(600);
+        let mut events = evs(vec![
+            session_start("S"),                                                                       // 1
+            user("fix parser"),                                                                       // 2
+            asst_calls(&[("c1", "edit", r#"{"path":"src/a.rs","old":"x","new":"y"}"#)]),             // 3
+            Kind::Permission { call_id: "c1".into(), decision: "allow".into(), by: "mode".into() },   // 4
+            result("c1", "edit", "edited src/a.rs"),                                                  // 5
+            asst_calls(&[("c2", "bash", r#"{"command":"cargo test"}"#)]),                             // 6
+            with_artifact(result("c2", "bash", "long output"), "/s/artifacts/c3.txt"),                // 7
+            asst_calls(&[("c3", "edit", r#"{"path":"src/a.rs","old":"y","new":"z"}"#)]),              // 8
+            result("c3", "edit", "edited src/a.rs"),                                                  // 9
+            asst_calls(&[("c4", "edit", r#"{"path":"src/b.rs"}"#), ("c5", "read", r#"{"path":"src/c.rs"}"#)]), // 10
+            failed(result("c4", "edit", "no match")),                                                 // 11: a failed edit changed nothing
+            result("c5", "read", "file"),                                                             // 12: a read changes nothing
+            asst_calls(&[("c6", "todo", r#"{"items":[{"text":"old","status":"done"}]}"#)]),          // 13
+            result("c6", "todo", "[x] old"),                                                          // 14
+            asst_calls(&[("c7", "todo", r#"{"items":[{"text":"x","status":"pending"},{"text":"y","status":"in_progress"},{"text":"z","status":"done"}]}"#)]), // 15
+            result("c7", "todo", "[ ] x\n[>] y\n[x] z"),                                              // 16
+            user(&long),                                                                              // 17
+            asst_calls(&[("c8", "write", r#"{"path":"src/new.rs","content":"fn main(){}"}"#)]),       // 18
+            result("c8", "write", "wrote src/new.rs"),                                                // 19
+            asst("done", ""),                                                                         // 20
+        ]);
+        let dir = Path::new("/s");
+
+        let toc = table_of_contents(&events, dir);
+        assert!(toc.starts_with("## Table of contents (generated by Xolotl)\nRaw history: /s/events.jsonl\n"));
+        assert!(toc.contains("- seq 2: fix parser"));
+        assert!(toc.contains("- src/a.rs — seq 5, 9")); // one line per file, every change in order
+        assert!(toc.contains("- src/new.rs — seq 19")); // `write` counts too
+        assert!(!toc.contains("src/b.rs") && !toc.contains("src/c.rs")); // failed edit, read
+        assert!(toc.contains("- /s/artifacts/c3.txt — seq 7"));
+        assert!(toc.contains("[ ] x\n[>] y\n[x] z")); // the latest todo call wins
+        assert!(!toc.contains("[x] old"));
+        // a long user message is cut to 500 bytes
+        assert!(toc.contains(&format!("- seq 17: {}\n", "a".repeat(500))));
+        assert!(!toc.contains(&"a".repeat(501)));
+        // the sections come in the documented order
+        let at = |h: &str| toc.find(h).unwrap_or_else(|| panic!("missing {h}"));
+        assert!(at("### User messages") < at("### Files changed") && at("### Files changed") < at("### Saved outputs") && at("### Saved outputs") < at("### Todo"));
+        // empty sections say so
+        let bare = table_of_contents(&evs(vec![session_start("S")]), dir);
+        assert_eq!(bare.matches("(none)").count(), 4);
+
+        // summary_message: only events up to the cut (seq 16: before the long request and the write)
+        let header = "[Session summary — events 1–16 compacted. Raw history: /s/events.jsonl (line = seq); read/grep it for exact details.]";
+        let cut = Cut { from_seq: 1, to_seq: 16, mid_turn: false };
+        let msg = summary_message("SUM", &cut, &events, dir);
+        assert_eq!(msg, format!("{header}\n\nSUM\n\n{}", table_of_contents(&events[..16], dir)));
+        assert!(!msg.contains("src/new.rs") && !msg.contains("## Current request"));
+
+        // mid-turn: the active request (the last user event at or before the cut) follows in full, not cut to 500
+        events.push(ev(21, user("a later request")));
+        let cut = Cut { from_seq: 1, to_seq: 19, mid_turn: true };
+        let msg = summary_message("SUM", &cut, &events, dir);
+        assert!(msg.starts_with("[Session summary — events 1–19 compacted."));
+        assert!(msg.contains("SUM") && msg.contains(&table_of_contents(&events[..19], dir)));
+        assert!(msg.ends_with(&format!("\n\n## Current request (verbatim)\n{long}")));
+        assert!(!msg.contains("a later request"));
+    }
+
+    #[test]
+    fn summary_prompt_sections_and_focus() {
+        let p = summary_prompt(None);
+        for s in ["## Goal", "## Current state", "## Decisions and why", "## Files touched", "## Failed attempts and why they failed", "## Open TODOs and next step"] {
+            assert!(p.contains(s), "missing {s}");
+        }
+        assert!(p.ends_with("Do not call tools.") && !p.contains("Focus:"));
+        let p = summary_prompt(Some("parser"));
+        assert!(p.ends_with("Do not call tools.\nFocus: parser"));
     }
 }
