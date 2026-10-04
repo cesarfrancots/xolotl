@@ -2,5 +2,6 @@
 
 mod llm;
 mod store;
+mod tools;
 
 fn main() {}
