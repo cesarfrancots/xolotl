@@ -22,7 +22,7 @@ pub enum Message {
 }
 
 impl Message {
-    /// OpenAI-style chat message. An empty assistant `text` is sent as `""` (ruling R1, unconfirmed by the API probe).
+    /// OpenAI-style chat message. An empty assistant `text` is sent as `""`; the API accepts `""`, null or no `content` there.
     pub fn to_wire(&self) -> Value {
         match self {
             Message::System(s) => json!({"role": "system", "content": s}),
@@ -65,13 +65,14 @@ pub struct Reply {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LlmError { Auth(String), ContextOverflow(String), Http { status: u16, body: String }, Network(String) }
+pub enum LlmError { Auth(String), ContextOverflow(String), Quota(String), Http { status: u16, body: String }, Network(String) }
 
 impl fmt::Display for LlmError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LlmError::Auth(m) => write!(f, "authentication failed: {m}"),
             LlmError::ContextOverflow(m) => write!(f, "context window exceeded: {m}"),
+            LlmError::Quota(m) => write!(f, "quota or balance exhausted: {m}"),
             LlmError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
             LlmError::Network(m) => write!(f, "network error: {m}"),
         }
@@ -286,12 +287,15 @@ pub fn apply_chunk(state: &mut StreamState, chunk: &Value, on: &mut dyn FnMut(De
         on(Delta::Text(t));
     }
     for tc in delta["tool_calls"].as_array().into_iter().flatten() {
-        // ponytail: a fragment without `index` merges into call 0; revisit if the API probe shows providers omit it.
+        let (id, name, args) = (tc["id"].as_str().unwrap_or(""), tc["function"]["name"].as_str().unwrap_or(""),
+                                tc["function"]["arguments"].as_str().unwrap_or(""));
+        if id.is_empty() && name.is_empty() && args.is_empty() { continue; } // nothing to add, and no phantom call
+        // ponytail: Z.ai always sends `index` (docs/glm-api-notes.md #3); a fragment without one merges into call 0.
         let call = state.calls.entry(tc["index"].as_u64().unwrap_or(0))
             .or_insert_with(|| ToolCall { id: String::new(), name: String::new(), args: String::new() });
-        if call.id.is_empty() { call.id.push_str(tc["id"].as_str().unwrap_or("")); }
-        if call.name.is_empty() { call.name.push_str(tc["function"]["name"].as_str().unwrap_or("")); }
-        call.args.push_str(tc["function"]["arguments"].as_str().unwrap_or(""));
+        if call.id.is_empty() { call.id.push_str(id); }
+        if call.name.is_empty() { call.name.push_str(name); }
+        call.args.push_str(args);
     }
     if let Some(f) = choice["finish_reason"].as_str() { state.reply.finish_reason = f.to_string(); }
 }
@@ -300,19 +304,43 @@ pub fn finish(state: StreamState) -> Reply {
     Reply { tool_calls: state.calls.into_values().collect(), ..state.reply }
 }
 
-/// Substrings that mark a 400 as a context overflow. Provisional until the API probe records the real body.
-const OVERFLOW_MARKERS: [&str; 5] = ["context", "too long", "max length", "exceed", "1261"];
+/// HTTP 429 business codes that are permanent, not transient (docs/glm-api-notes.md "Retry caution"):
+/// no balance, period limit, plan expired, weekly/monthly limit, plan lacks the model.
+const QUOTA_CODES: [&str; 5] = ["1113", "1308", "1309", "1310", "1311"];
 
+/// `error.code` of a Z.ai error envelope. The API sends a string; a number is accepted too.
+fn error_code(v: &Value) -> Option<String> {
+    match &v["error"]["code"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Context overflow (docs/glm-api-notes.md #6): `error.code` 1261, else `error.message` (or the raw body when it
+/// is not JSON) containing "prompt too long". Looser wording such as "context" or "exceed" is deliberately not matched.
 fn overflows(body: &str) -> bool {
-    let lower = body.to_lowercase();
-    OVERFLOW_MARKERS.iter().any(|m| lower.contains(m))
+    let too_long = |s: &str| s.to_lowercase().contains("prompt too long");
+    match serde_json::from_str::<Value>(body) {
+        Ok(v) => error_code(&v).as_deref() == Some("1261") || v["error"]["message"].as_str().is_some_and(too_long),
+        Err(_) => too_long(body),
+    }
+}
+
+/// The message of a permanent-quota 429 body (see `QUOTA_CODES`), or None for any other body.
+fn quota_message(body: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    QUOTA_CODES.contains(&error_code(&v)?.as_str())
+        .then(|| v["error"]["message"].as_str().unwrap_or(body).to_string())
 }
 
 pub fn classify(status: u16, body: &str) -> LlmError {
+    let http = || LlmError::Http { status, body: body.to_string() };
     match status {
         401 | 403 => LlmError::Auth(format!("HTTP {status}: {body}")),
         400 if overflows(body) => LlmError::ContextOverflow(body.to_string()),
-        _ => LlmError::Http { status, body: body.to_string() },
+        429 => quota_message(body).map_or_else(http, LlmError::Quota),
+        _ => http(),
     }
 }
 
@@ -345,7 +373,7 @@ mod tests {
             tool_calls: vec![ToolCall { id: "c1".into(), name: "read".into(), args: r#"{"path":"a"}"#.into() }] };
         let w = m.to_wire();
         assert_eq!(w["role"], "assistant");
-        assert_eq!(w["content"], "");                 // or null, if M0 probe (d) says so
+        assert_eq!(w["content"], "");                 // the API also accepts null or an omitted content here
         assert_eq!(w["tool_calls"][0]["id"], "c1");
         assert_eq!(w["tool_calls"][0]["type"], "function");
         assert_eq!(w["tool_calls"][0]["function"]["name"], "read");
@@ -380,8 +408,11 @@ mod tests {
         assert_eq!(m.requests[1].1, 1);
     }
 
-    // Provisional until the API probe (Task 0) records the real overflow body in docs/glm-api-notes.md.
-    const OVERFLOW_BODY_FROM_NOTES: &str = r#"{"error":{"code":"1261","message":"Prompt exceeds max length"}}"#;
+    // docs/glm-api-notes.md #6: HTTP 400, code 1261, message "Prompt too long", inside the live-verified `{"error":{code,message}}`
+    // envelope. The overflow itself was never reproduced live, so this body is built from the docs row, not captured.
+    const OVERFLOW_BODY_FROM_NOTES: &str = r#"{"error":{"code":"1261","message":"Prompt too long"}}"#;
+    // docs/glm-api-notes.md "Error format": live-captured HTTP 429 with no balance on the pay-as-you-go API.
+    const QUOTA_BODY_FROM_NOTES: &str = r#"{"error":{"code":"1113","message":"Insufficient balance or no resource package. Please recharge."}}"#;
 
     /// Every `data:` payload up to `[DONE]`; blank lines and `:` comments are skipped.
     fn sse_chunks(raw: &str) -> Vec<Value> {
@@ -442,11 +473,13 @@ mod tests {
     #[test] fn malformed_or_empty_chunks_are_ignored() {
         let cs = [json!({}), json!({"choices":[]}), json!({"choices":[{}]}), json!({"usage":null}),
                   json!({"choices":[{"delta":{"content":"","reasoning_content":null,"tool_calls":"x"},"finish_reason":null}]}),
-                  json!({"choices":[{"delta":{"tool_calls":[{}]}}]})];
+                  json!({"choices":[{"delta":{"tool_calls":[{}]}}]}),
+                  json!({"choices":[{"delta":{"tool_calls":[{"index":3,"type":"function","function":{}}]}}]})];
         let (st, seen) = run(&cs);
         assert!(seen.is_empty() && !st.emitted);
         let r = finish(st);
         assert_eq!((r.text.as_str(), r.usage, r.finish_reason.as_str()), ("", Usage::default(), ""));
+        assert!(r.tool_calls.is_empty()); // fragments with no id, name or arguments leave no phantom call
     }
     #[test] fn classify_errors() {
         assert!(matches!(classify(401, ""), LlmError::Auth(_)));
@@ -455,6 +488,40 @@ mod tests {
         assert!(matches!(classify(400, "bad request"), LlmError::Http { status: 400, .. }));
         assert!(matches!(classify(429, ""), LlmError::Http { status: 429, .. }));
         assert!(matches!(classify(500, OVERFLOW_BODY_FROM_NOTES), LlmError::Http { status: 500, .. })); // overflow is 400 only
+    }
+    #[test] fn overflow_rule() {
+        // code 1261 wins whatever the message says, as a string or a number
+        assert!(matches!(classify(400, r#"{"error":{"code":"1261","message":"anything"}}"#), LlmError::ContextOverflow(_)));
+        assert!(matches!(classify(400, r#"{"error":{"code":1261,"message":"anything"}}"#), LlmError::ContextOverflow(_)));
+        // fallback: the message, case-insensitively, or the raw body when it is not JSON
+        assert!(matches!(classify(400, r#"{"error":{"code":"9999","message":"The PROMPT TOO LONG for this model"}}"#), LlmError::ContextOverflow(_)));
+        assert!(matches!(classify(400, "Prompt too long"), LlmError::ContextOverflow(_)));
+        // loose wording with another code is not an overflow
+        for body in [r#"{"error":{"code":"1210","message":"context window parameter exceeds the allowed range"}}"#,
+                     r#"{"error":{"code":"1211","message":"max length of tokens exceeded"}}"#, "context exceeded"] {
+            assert!(matches!(classify(400, body), LlmError::Http { status: 400, .. }), "{body}");
+        }
+        // an error object inside a 2xx stream follows the same rule
+        let loose = r#"{"error":{"code":"1305","message":"context overloaded"}}"#;
+        assert!(matches!(stream_error(200, loose), Some(LlmError::Http { status: 200, .. })));
+        assert!(matches!(stream_error(200, r#"data: {"error":{"code":1261,"message":"x"}}"#), Some(LlmError::ContextOverflow(_))));
+    }
+    #[test] fn quota_errors_are_classified_and_not_retried() {
+        let LlmError::Quota(msg) = classify(429, QUOTA_BODY_FROM_NOTES) else { panic!("1113 should be Quota") };
+        assert_eq!(msg, "Insufficient balance or no resource package. Please recharge.");
+        assert_eq!(LlmError::Quota(msg).to_string(), "quota or balance exhausted: Insufficient balance or no resource package. Please recharge.");
+        for code in ["1113", "1308", "1309", "1310", "1311"] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#);
+            assert_eq!(classify(429, &body), LlmError::Quota("m".into()), "{code}");
+        }
+        assert_eq!(classify(429, r#"{"error":{"code":1308,"message":"m"}}"#), LlmError::Quota("m".into())); // numeric code
+        // transient rate limits and other statuses stay plain Http, and are still retried
+        let rate = classify(429, r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#);
+        assert!(matches!(rate, LlmError::Http { status: 429, .. }));
+        assert_eq!(retry_delay(&rate, 0, false, None), Some(Duration::from_secs(1)));
+        assert!(matches!(classify(400, QUOTA_BODY_FROM_NOTES), LlmError::Http { status: 400, .. }));
+        assert_eq!(retry_delay(&LlmError::Quota("x".into()), 0, false, None), None);
+        assert_eq!(retry_delay(&LlmError::Quota("x".into()), 0, false, Some(5)), None);
     }
     #[test] fn stream_error_detection() {
         let e = r#"{"error":{"code":"1305","message":"busy"}}"#;
@@ -465,6 +532,31 @@ mod tests {
         for ok in [r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#, r#"data: {"error":null,"choices":[]}"#,
                    "data: [DONE]", ": keepalive", "", "not json"] {
             assert_eq!(stream_error(200, ok), None, "{ok}");
+        }
+    }
+    #[test] fn fixtures_parse() {
+        // Raw bodies captured from the live API (docs/glm-api-notes.md), run through the same line parsing as the client.
+        let parse = |raw: &str| finish(run(&sse_chunks(raw)).0);
+        let cities = |r: &Reply| r.tool_calls.iter().map(|c| {
+            assert_eq!(c.name, "get_time");
+            assert!(c.id.starts_with("call_"), "{c:?}");
+            serde_json::from_str::<Value>(&c.args).unwrap()["city"].as_str().unwrap().to_string()
+        }).collect::<Vec<_>>();
+
+        let text = parse(include_str!("../fixtures/stream_text.sse"));
+        assert!(!text.text.is_empty() && !text.reasoning.is_empty() && text.tool_calls.is_empty());
+        assert_eq!((text.finish_reason.as_str(), text.usage), ("stop", Usage { prompt: 14, completion: 220, cached: 0 }));
+
+        let tools = parse(include_str!("../fixtures/stream_tools.sse"));
+        assert_eq!((tools.finish_reason.as_str(), tools.usage.prompt), ("tool_calls", 177));
+        assert_eq!(cities(&tools), ["London"]);
+
+        // whole calls in one chunk each, and index-based partial `arguments` (`tool_stream: true`): same result
+        for raw in [include_str!("../fixtures/stream_two_tools.sse"), include_str!("../fixtures/stream_two_tools_partial.sse")] {
+            let two = parse(raw);
+            assert_eq!(cities(&two), ["Tokyo", "Paris"]);
+            assert_ne!(two.tool_calls[0].id, two.tool_calls[1].id);
+            assert_eq!((two.finish_reason.as_str(), two.usage.prompt, two.usage.cached), ("tool_calls", 176, 128));
         }
     }
     #[test] fn retry_policy() {
@@ -479,6 +571,7 @@ mod tests {
         assert_eq!(retry_delay(&LlmError::Network("x".into()), 0, false, None), Some(s(1)));
         assert_eq!(retry_delay(&LlmError::Network("x".into()), 0, true, None), None); // already streamed: never retry
         assert_eq!(retry_delay(&LlmError::Auth("x".into()), 0, false, None), None);
+        assert_eq!(retry_delay(&LlmError::Quota("x".into()), 0, false, None), None);
         assert_eq!(retry_delay(&LlmError::Http { status: 400, body: String::new() }, 0, false, None), None);
     }
     #[test] fn request_body_fields() {
