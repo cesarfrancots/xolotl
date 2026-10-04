@@ -1,11 +1,13 @@
 //! File tools `read`, `write`, `edit` (spec §7, §7.1), shell selection and the `bash` tool (§7.2), and the
 //! char-boundary-safe `clip` helpers.
 
-use serde_json::Value;
+use globset::Glob;
+use regex::Regex;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -542,6 +544,289 @@ pub(crate) fn bash(ctx: &mut ToolCtx, args: &Value, cancel: &AtomicBool) -> Tool
     ToolOut { ok: e.exit_code == Some(0), text: e.output + &footer, exit_code: e.exit_code, cancelled: e.cancelled }
 }
 
+// ---- search tools, todo, schemas and dispatcher (spec §7) ----
+
+pub const TOOL_NAMES: [&str; 7] = ["read", "write", "edit", "glob", "grep", "bash", "todo"];
+
+/// `glob` and `grep` list at most this many paths; `grep` in content mode, this many matching lines.
+const MAX_RESULTS: usize = 200;
+/// Matched and context lines are cut to this many bytes.
+const MAX_MATCH_LINE: usize = 300;
+/// `grep` skips files larger than this instead of loading them whole.
+const MAX_GREP_FILE: u64 = 8 << 20;
+
+/// Runs one tool call. Never panics: an unknown name or bad arguments come back as `ok: false`.
+pub fn run(ctx: &mut ToolCtx, name: &str, call_id: &str, args: &Value, cancel: &AtomicBool) -> ToolOut {
+    match name {
+        "read" => read(ctx, args),
+        "write" => write(ctx, call_id, args),
+        "edit" => edit(ctx, call_id, args),
+        "glob" => glob(ctx, args),
+        "grep" => grep(ctx, args),
+        "bash" => bash(ctx, args, cancel),
+        "todo" => todo(args),
+        _ => ToolOut::err(format!("unknown tool `{name}`; available: {}", TOOL_NAMES.join(", "))),
+    }
+}
+
+pub(crate) fn glob(ctx: &ToolCtx, args: &Value) -> ToolOut {
+    done(glob_impl(ctx, args))
+}
+
+pub(crate) fn grep(ctx: &ToolCtx, args: &Value) -> ToolOut {
+    done(grep_impl(ctx, args))
+}
+
+pub(crate) fn todo(args: &Value) -> ToolOut {
+    done(todo_impl(args))
+}
+
+/// Like `str_arg` but optional; `opt_arg` cannot do this because its getter cannot return a borrow.
+fn opt_str<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_str().map(Some).ok_or_else(|| format!("argument `{key}` must be a string")),
+    }
+}
+
+/// The directory (or file) a search starts from: `path` if given, else the project root.
+fn search_base(ctx: &ToolCtx, args: &Value) -> Result<PathBuf, String> {
+    let Some(path) = opt_str(args, "path")? else { return Ok(ctx.root.clone()) };
+    let base = ctx.root.join(path);
+    fs::metadata(&base).map_err(|e| io_err(path, &e))?;
+    Ok(base)
+}
+
+/// Every file under `base` in path order. Respects `.gitignore` with or without a `.git` directory, lists
+/// hidden files, and never enters `.git`.
+fn walk(base: &Path) -> impl Iterator<Item = PathBuf> {
+    ignore::WalkBuilder::new(base)
+        .hidden(false)
+        .require_git(false)
+        .sort_by_file_path(Ord::cmp)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .map(ignore::DirEntry::into_path)
+}
+
+/// How a path is shown to the model: relative to the root with `/` separators; absolute when outside the root.
+fn shown(ctx: &ToolCtx, p: &Path) -> String {
+    let rel = p.strip_prefix(&ctx.root).ok().filter(|r| !r.components().any(|c| c == Component::ParentDir));
+    rel.unwrap_or(p).to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// `lines` (at most `MAX_RESULTS`), then a footer like `(200 of 205 shown)` when `total` is larger.
+fn capped(mut lines: Vec<String>, total: usize, what: &str) -> String {
+    if total == 0 {
+        return "(no matches)".into();
+    }
+    if total > MAX_RESULTS {
+        lines.push(format!("({MAX_RESULTS} of {total}{what} shown)"));
+    }
+    lines.join("\n")
+}
+
+fn glob_impl(ctx: &ToolCtx, args: &Value) -> Result<String, String> {
+    let pattern = str_arg(args, "pattern")?;
+    let matcher = Glob::new(pattern).map_err(|e| format!("invalid glob pattern: {e}"))?.compile_matcher();
+    let base = search_base(ctx, args)?;
+    let mut found: Vec<(SystemTime, String)> = walk(&base)
+        .filter(|p| matcher.is_match(p.strip_prefix(&base).unwrap_or(p)))
+        .map(|p| (fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH), shown(ctx, &p)))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))); // newest first
+    let total = found.len();
+    Ok(capped(found.into_iter().take(MAX_RESULTS).map(|f| f.1).collect(), total, ""))
+}
+
+fn grep_impl(ctx: &ToolCtx, args: &Value) -> Result<String, String> {
+    let re = Regex::new(str_arg(args, "regex")?).map_err(|e| format!("invalid regex: {e}"))?;
+    let content = match opt_str(args, "mode")? {
+        None | Some("files") => false,
+        Some("content") => true,
+        Some(other) => return Err(format!("argument `mode` must be `files` or `content` (got `{other}`)")),
+    };
+    let context = opt_arg(args, "context", Value::as_u64, "a non-negative integer")?.unwrap_or(0) as usize;
+    let filter = match opt_str(args, "glob")? {
+        Some(g) => Some(Glob::new(g).map_err(|e| format!("invalid glob: {e}"))?.compile_matcher()),
+        None => None,
+    };
+    let base = search_base(ctx, args)?;
+
+    // `total` counts every matching file (files mode) or line (content mode); `out` and `kept` are what is shown.
+    let (mut out, mut total, mut kept, mut skipped) = (Vec::new(), 0, 0, 0);
+    for p in walk(&base) {
+        if filter.as_ref().is_some_and(|g| !g.is_match(p.strip_prefix(&base).unwrap_or(&p))) {
+            continue;
+        }
+        // ponytail: files are read whole, so anything over MAX_GREP_FILE is skipped (and reported). Upgrade path:
+        // scan it line by line through a BufReader.
+        if fs::metadata(&p).is_ok_and(|m| m.len() > MAX_GREP_FILE) {
+            skipped += 1;
+            continue;
+        }
+        let Ok(bytes) = fs::read(&p) else { continue };
+        if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let hits: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, _)| i).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        if content {
+            total += hits.len();
+            let room = MAX_RESULTS - kept;
+            render_hits(&mut out, &shown(ctx, &p), &lines, &hits[..hits.len().min(room)], context);
+            kept += hits.len().min(room);
+        } else {
+            total += 1;
+            if out.len() < MAX_RESULTS {
+                out.push(shown(ctx, &p));
+            }
+        }
+    }
+    let mut text = capped(out, total, if content { " matches" } else { "" });
+    if skipped > 0 {
+        text += &format!("\n(skipped {skipped} file{} over {} MB)", if skipped == 1 { "" } else { "s" }, MAX_GREP_FILE >> 20);
+    }
+    Ok(text)
+}
+
+/// Appends the lines at `hits` (sorted, 0-based) with `context` lines around each: `name:line:text` for a hit,
+/// `name-line-text` for context. Overlapping windows merge; a gap, or a new file, gets a `--` line.
+fn render_hits(out: &mut Vec<String>, name: &str, lines: &[&str], hits: &[usize], context: usize) {
+    let mut printed_to: Option<usize> = None; // lines before this index are already in `out`
+    for &i in hits {
+        let start = i.saturating_sub(context).max(printed_to.unwrap_or(0));
+        let end = i.saturating_add(context).saturating_add(1).min(lines.len());
+        if context > 0 && !out.is_empty() && printed_to.is_none_or(|p| start > p) {
+            out.push("--".into());
+        }
+        for (j, line) in lines.iter().enumerate().take(end).skip(start) {
+            let sep = if hits.binary_search(&j).is_ok() { ':' } else { '-' };
+            out.push(format!("{name}{sep}{}{sep}{}", j + 1, clip(line, MAX_MATCH_LINE)));
+        }
+        printed_to = Some(printed_to.map_or(end, |p| p.max(end)));
+    }
+}
+
+fn todo_impl(args: &Value) -> Result<String, String> {
+    let items = args.get("items").and_then(Value::as_array).ok_or("missing argument `items`")?;
+    let lines = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let at = |e: String| format!("items[{i}]: {e}");
+            let text = str_arg(item, "text").map_err(at)?;
+            let mark = match str_arg(item, "status").map_err(at)? {
+                "pending" => "[ ]",
+                "in_progress" => "[>]",
+                "done" => "[x]",
+                other => return Err(at(format!("invalid status `{other}`; use pending, in_progress or done"))),
+            };
+            Ok(format!("{mark} {text}"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(if lines.is_empty() { "(empty todo list)".into() } else { lines.join("\n") })
+}
+
+/// OpenAI function-calling schemas for the seven tools, in `TOOL_NAMES` order.
+pub fn schemas() -> Vec<Value> {
+    let s = |description: &str| json!({ "type": "string", "description": description });
+    let tool = |name: &str, description: &str, properties: Value, required: Value| {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": { "type": "object", "properties": properties, "required": required },
+            },
+        })
+    };
+    vec![
+        tool(
+            "read",
+            "Read a file. Returns numbered lines; use offset (first line, 1-based) and limit to page through long files.",
+            json!({
+                "path": s("File path, relative to the project root or absolute."),
+                "offset": { "type": "integer", "description": "First line to return (1-based)." },
+                "limit": { "type": "integer", "description": "Maximum number of lines to return." },
+            }),
+            json!(["path"]),
+        ),
+        tool(
+            "write",
+            "Create or overwrite a file with `content`, creating parent directories. An existing file must have been read first.",
+            json!({ "path": s("File path."), "content": s("The complete new file content.") }),
+            json!(["path", "content"]),
+        ),
+        tool(
+            "edit",
+            "Replace `old` with `new` in a file. Needs a prior `read` of the file, and `old` must be a unique match unless replace_all is set.",
+            json!({
+                "path": s("File path."),
+                "old": s("Text to replace, copied exactly from the file."),
+                "new": s("Replacement text."),
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence of `old`." },
+            }),
+            json!(["path", "old", "new"]),
+        ),
+        tool(
+            "glob",
+            "Find files by glob pattern such as `**/*.rs`, matched relative to `path`. Respects .gitignore; newest first, at most 200 results.",
+            json!({
+                "pattern": s("Glob pattern."),
+                "path": s("Directory to search (default: the project root)."),
+            }),
+            json!(["pattern"]),
+        ),
+        tool(
+            "grep",
+            "Search file contents with a regex. Uses Rust regex syntax (no lookaround). Respects .gitignore and skips binary files. Mode `files` (default) lists matching files; `content` shows matching lines.",
+            json!({
+                "regex": s("Regular expression, matched against each line."),
+                "path": s("Directory or file to search (default: the project root)."),
+                "glob": s("Only search files matching this glob, e.g. `*.rs`."),
+                "mode": { "type": "string", "enum": ["files", "content"], "description": "`files` (default) or `content`." },
+                "context": { "type": "integer", "description": "Lines of context around each match (content mode)." },
+            }),
+            json!(["regex"]),
+        ),
+        tool(
+            "bash",
+            "Run a shell command in a fresh process in the project root; each call starts clean and has no stdin. It has a timeout, and must not start servers, watchers or other long-running processes.",
+            json!({
+                "command": s("The command to run."),
+                "timeout": { "type": "integer", "description": "Timeout in seconds (default 120, max 600)." },
+            }),
+            json!(["command"]),
+        ),
+        tool(
+            "todo",
+            "Track your plan for multi-step work. Each call replaces the whole list with `items`, so always send the full list.",
+            json!({
+                "items": {
+                    "type": "array",
+                    "description": "The complete todo list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": s("What to do."),
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "done"] },
+                        },
+                        "required": ["text", "status"],
+                    },
+                },
+            }),
+            json!(["items"]),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,5 +1285,231 @@ mod tests {
 
         assert_eq!(bash(&mut c, &json!({}), &AtomicBool::new(false)).text, "missing argument `command`");
         assert!(!bash(&mut c, &json!({ "command": 7 }), &AtomicBool::new(false)).ok);
+    }
+
+    // ---- search tools, todo, schemas, dispatcher (Task 6) ----
+
+    fn call(c: &mut ToolCtx, name: &str, args: Value) -> ToolOut {
+        super::run(c, name, "t1", &args, &AtomicBool::new(false))
+    }
+    fn put_all(c: &ToolCtx, files: &[(&str, &str)]) {
+        for (name, body) in files {
+            let p = c.root.join(name);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+    }
+    fn sorted_lines(text: &str) -> Vec<&str> {
+        let mut v: Vec<&str> = text.lines().collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn glob_respects_gitignore_includes_hidden_excludes_git() {
+        let mut c = ctx("glob-ignore");
+        put_all(
+            &c,
+            &[("a.rs", ""), ("src/b.rs", ""), ("target/c.rs", ""), (".github/w.yml", ""), (".git/config", ""), (".gitignore", "target/\n")],
+        );
+        let o = call(&mut c, "glob", json!({ "pattern": "**/*.rs" }));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(sorted_lines(&o.text), ["a.rs", "src/b.rs"]);
+        assert_eq!(call(&mut c, "glob", json!({ "pattern": "**/*.yml" })).text, ".github/w.yml");
+        let o = call(&mut c, "glob", json!({ "pattern": "**/config" }));
+        assert!(o.ok && o.text == "(no matches)", "{}", o.text);
+        // `path` narrows the search; output paths stay relative to the root
+        assert_eq!(call(&mut c, "glob", json!({ "pattern": "*.rs", "path": "src" })).text, "src/b.rs");
+    }
+
+    #[test]
+    fn glob_newest_first_and_capped() {
+        let mut c = ctx("glob-cap");
+        let base = SystemTime::now() - Duration::from_secs(10_000);
+        for i in 0..205u64 {
+            let f = fs::File::create(c.root.join(format!("f{i:03}.txt"))).unwrap();
+            f.set_modified(base + Duration::from_secs(i)).unwrap();
+        }
+        let o = call(&mut c, "glob", json!({ "pattern": "*.txt" }));
+        assert!(o.ok, "{}", o.text);
+        let l: Vec<&str> = o.text.lines().collect();
+        assert_eq!(l.len(), 201, "{}", o.text);
+        assert_eq!((l[0], l[199], l[200]), ("f204.txt", "f005.txt", "(200 of 205 shown)"));
+    }
+
+    #[test]
+    fn glob_outside_root_is_absolute_and_bad_input_fails() {
+        let mut c = ctx("glob-outside");
+        let other = test_dir("glob-other");
+        fs::write(other.join("x.txt"), "").unwrap();
+        let o = call(&mut c, "glob", json!({ "pattern": "*.txt", "path": other.to_string_lossy() }));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(o.text, other.join("x.txt").to_string_lossy().replace('\\', "/"));
+        // a `..` escape counts as outside too
+        let up = format!("../{}", other.file_name().unwrap().to_string_lossy());
+        let o = call(&mut c, "glob", json!({ "pattern": "*.txt", "path": up }));
+        assert!(o.ok && !o.text.starts_with(".."), "{}", o.text);
+
+        let o = call(&mut c, "glob", json!({ "pattern": "*.txt", "path": "nope" }));
+        assert!(!o.ok && o.text.starts_with("file not found"), "{}", o.text);
+        assert!(!call(&mut c, "glob", json!({ "pattern": "[" })).ok);
+        assert_eq!(call(&mut c, "glob", json!({})).text, "missing argument `pattern`");
+        assert_eq!(call(&mut c, "glob", json!({ "pattern": "*", "path": 5 })).text, "argument `path` must be a string");
+    }
+
+    #[test]
+    fn grep_modes_context_and_errors() {
+        let mut c = ctx("grep");
+        let long = format!("a{}", "é".repeat(200)); // 401 bytes; byte 300 falls inside a char
+        put_all(
+            &c,
+            &[
+                ("src/b.rs", "one\ntwo\nneedle here\nfour\n"),
+                ("docs/x.md", "a needle\n"),
+                ("miss.txt", "nothing\n"),
+                ("blob.bin", "needle\0needle"),
+                ("long.txt", long.as_str()),
+                ("skipme/n.txt", "needle\n"),
+                (".gitignore", "skipme/\n"), // honoured although this tree has no .git directory
+            ],
+        );
+        // files mode is the default; the binary and the ignored files are skipped
+        let o = call(&mut c, "grep", json!({ "regex": "needle" }));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(o.text, "docs/x.md\nsrc/b.rs");
+        assert_eq!(call(&mut c, "grep", json!({ "regex": "needle", "glob": "*.md" })).text, "docs/x.md");
+        assert_eq!(call(&mut c, "grep", json!({ "regex": "zzz" })).text, "(no matches)");
+
+        let content = |c: &mut ToolCtx, extra: Value| {
+            let mut args = json!({ "regex": "needle", "mode": "content", "glob": "*.rs" });
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            call(c, "grep", args)
+        };
+        assert_eq!(content(&mut c, json!({})).text, "src/b.rs:3:needle here");
+        assert_eq!(content(&mut c, json!({ "context": 1 })).text, "src/b.rs-2-two\nsrc/b.rs:3:needle here\nsrc/b.rs-4-four");
+        // groups are separated by `--`, also between files
+        let o = call(&mut c, "grep", json!({ "regex": "needle", "mode": "content", "context": 1 }));
+        assert_eq!(o.text, "docs/x.md:1:a needle\n--\nsrc/b.rs-2-two\nsrc/b.rs:3:needle here\nsrc/b.rs-4-four");
+
+        let o = call(&mut c, "grep", json!({ "regex": "(" }));
+        assert!(!o.ok && o.text.starts_with("invalid regex"), "{}", o.text);
+        let o = call(&mut c, "grep", json!({ "regex": "x", "mode": "lines" }));
+        assert!(!o.ok && o.text.contains("`files` or `content`"), "{}", o.text);
+        assert_eq!(call(&mut c, "grep", json!({})).text, "missing argument `regex`");
+
+        // a long matching line is cut at 300 bytes on a char boundary
+        let o = call(&mut c, "grep", json!({ "regex": "é", "mode": "content" }));
+        let text = o.text.strip_prefix("long.txt:1:").unwrap_or_else(|| panic!("{}", o.text));
+        assert_eq!(text, format!("a{}", "é".repeat(149)));
+        assert_eq!(text.len(), 299);
+    }
+
+    #[test]
+    fn grep_context_groups_merge_and_stay_exact() {
+        let mut c = ctx("grep-ctx");
+        put_all(&c, &[("f.txt", "m1\nm2\nx\nx\nx\nm3\n")]);
+        let o = call(&mut c, "grep", json!({ "regex": "m", "mode": "content", "context": 1 }));
+        // m1 and m2 are adjacent; x-lines 3 and 5 are context, line 4 is a gap
+        assert_eq!(o.text, "f.txt:1:m1\nf.txt:2:m2\nf.txt-3-x\n--\nf.txt-5-x\nf.txt:6:m3");
+    }
+
+    #[test]
+    fn grep_caps_files_and_matches() {
+        let mut c = ctx("grep-cap");
+        for i in 0..205 {
+            fs::write(c.root.join(format!("f{i:03}.txt")), "hit\n").unwrap();
+        }
+        let o = call(&mut c, "grep", json!({ "regex": "hit" }));
+        let l: Vec<&str> = o.text.lines().collect();
+        assert_eq!((l.len(), l[0], l[199], l[200]), (201, "f000.txt", "f199.txt", "(200 of 205 shown)"));
+
+        let mut c = ctx("grep-cap-lines");
+        put(&c, "m.txt", "hit\n".repeat(250));
+        let o = call(&mut c, "grep", json!({ "regex": "hit", "mode": "content" }));
+        let l: Vec<&str> = o.text.lines().collect();
+        assert_eq!((l.len(), l[0], l[199], l[200]), (201, "m.txt:1:hit", "m.txt:200:hit", "(200 of 250 matches shown)"));
+    }
+
+    #[test]
+    fn todo_renders_and_validates() {
+        let mut c = ctx("todo");
+        let items = json!([{ "text": "a", "status": "done" }, { "text": "b", "status": "in_progress" }, { "text": "c", "status": "pending" }]);
+        let o = call(&mut c, "todo", json!({ "items": items }));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(o.text, "[x] a\n[>] b\n[ ] c");
+
+        let o = call(&mut c, "todo", json!({ "items": [{ "text": "a", "status": "pending" }, { "text": "b", "status": "nope" }] }));
+        assert!(!o.ok && o.text.contains("items[1]") && o.text.contains("`nope`"), "{}", o.text);
+        let o = call(&mut c, "todo", json!({ "items": [{ "status": "done" }] }));
+        assert_eq!(o.text, "items[0]: missing argument `text`");
+        assert_eq!(call(&mut c, "todo", json!({})).text, "missing argument `items`");
+        // the list is replaced wholesale, so an empty one is valid
+        assert_eq!(call(&mut c, "todo", json!({ "items": [] })).text, "(empty todo list)");
+    }
+
+    #[test]
+    fn schemas_match_tools() {
+        let s = schemas();
+        assert_eq!(s.len(), 7);
+        let names: Vec<&str> = s.iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, TOOL_NAMES);
+        let required = [
+            ("read", vec!["path"]),
+            ("write", vec!["path", "content"]),
+            ("edit", vec!["path", "old", "new"]),
+            ("glob", vec!["pattern"]),
+            ("grep", vec!["regex"]),
+            ("bash", vec!["command"]),
+            ("todo", vec!["items"]),
+        ];
+        for (t, (name, want)) in s.iter().zip(required) {
+            assert_eq!(t["type"], "function", "{name}");
+            assert_eq!(t["function"]["name"], name);
+            assert_eq!(t["function"]["parameters"]["type"], "object", "{name}");
+            let got: Vec<&str> = t["function"]["parameters"]["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(got, want, "{name}");
+            // every required argument is declared, and the description is short prose
+            for r in &want {
+                assert!(t["function"]["parameters"]["properties"][r].is_object(), "{name}.{r}");
+            }
+            assert!(!t["function"]["description"].as_str().unwrap().is_empty(), "{name}");
+        }
+        let desc = |name: &str| s[TOOL_NAMES.iter().position(|n| *n == name).unwrap()]["function"]["description"].as_str().unwrap().to_string();
+        assert!(desc("grep").contains("Rust regex") && desc("grep").contains("no lookaround"));
+        let bash = desc("bash");
+        assert!(bash.contains("fresh process") && bash.contains("project root") && bash.contains("stdin") && bash.contains("servers"), "{bash}");
+        assert!(desc("read").contains("numbered") && desc("read").contains("offset") && desc("read").contains("limit"));
+        let edit = desc("edit");
+        assert!(edit.contains("read") && edit.contains("unique") && edit.contains("replace_all"), "{edit}");
+        assert!(desc("todo").contains("replaces the whole list"));
+        // the model sees the enums
+        let grep = &s[4]["function"]["parameters"]["properties"];
+        assert_eq!(grep["mode"]["enum"], json!(["files", "content"]));
+        let item = &s[6]["function"]["parameters"]["properties"]["items"]["items"];
+        assert_eq!(item["properties"]["status"]["enum"], json!(["pending", "in_progress", "done"]));
+        assert_eq!(item["required"], json!(["text", "status"]));
+    }
+
+    #[test]
+    fn run_dispatch_and_arg_errors() {
+        let mut c = ctx("run");
+        let o = call(&mut c, "fly", json!({}));
+        assert!(!o.ok);
+        assert_eq!(o.text, "unknown tool `fly`; available: read, write, edit, glob, grep, bash, todo");
+        let o = call(&mut c, "read", json!({}));
+        assert!(!o.ok);
+        assert_eq!(o.text, "missing argument `path`");
+        put(&c, "f.txt", "hi\n");
+        let o = call(&mut c, "read", json!({ "path": "f.txt" }));
+        assert!(o.ok && o.text == "     1\thi", "{}", o.text);
+        // write/edit receive the call id (backup file name) and share the read-tracking context
+        let o = super::run(&mut c, "edit", "call-9", &json!({ "path": "f.txt", "old": "hi", "new": "yo" }), &AtomicBool::new(false));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(fs::read_to_string(c.backups_dir.join("call-9.before")).unwrap(), "hi\n");
+        assert_eq!(call(&mut c, "write", json!({ "path": "g.txt", "content": "x" })).text, "wrote g.txt (1 lines)");
+        assert!(call(&mut c, "glob", json!({ "pattern": "*.txt" })).ok);
+        assert!(call(&mut c, "grep", json!({ "regex": "yo" })).ok);
+        assert!(call(&mut c, "todo", json!({ "items": [] })).ok);
+        assert_eq!(call(&mut c, "bash", json!({})).text, "missing argument `command`");
     }
 }
