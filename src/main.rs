@@ -9,6 +9,8 @@ mod tools;
 mod ui;
 
 use agent::{Agent, Outcome};
+use crossterm::event::{self, KeyEvent, KeyEventKind};
+use crossterm::style::Stylize;
 use llm::{ZaiClient, ZaiConfig};
 use perms::{Mode, Perms};
 use reedline::{
@@ -246,6 +248,11 @@ fn run() -> Result<ExitCode, String> {
     let root = env::home_dir().ok_or("cannot find the home directory")?.join(".xolotl");
     let (cfg, mode) = apply(load_config(&root.join("config.json"))?, &args)?;
     let api_key = api_key(&cfg.api_key_env).ok_or_else(|| format!("set {} to your Z.ai API key", cfg.api_key_env))?;
+    // Every tool shell inherits this process's environment: with the key left in it, `printenv` would put the key
+    // into a tool result, events.jsonl and the next request.
+    // SAFETY: no other thread exists yet. Only the main thread has run so far (`reg` ran as a child process and
+    // has exited); the Ctrl+C handler thread and the model's worker threads start later.
+    unsafe { env::remove_var(&cfg.api_key_env) };
     let cwd = project_root(args.cwd.as_deref())?;
     // the permission checks resolve relative paths against the process cwd
     env::set_current_dir(&cwd).map_err(|e| format!("cannot enter {}: {e}", cwd.display()))?;
@@ -362,17 +369,65 @@ fn headless(ctx: &Ctx, session: Session, model: &mut ZaiClient, mode: Mode, task
     ExitCode::from(code)
 }
 
+/// Tab completion over the slash commands. The completer's trie stops at any char that isn't alphanumeric or an
+/// "inclusion", so `/` must be one, or nothing gets in.
+fn slash_completer() -> DefaultCompleter {
+    let mut c = DefaultCompleter::with_inclusions(&['/']).set_min_word_len(2);
+    c.insert(SLASH_COMMANDS.map(String::from).to_vec());
+    c
+}
+
+/// Windows: crossterm has no paste event, so a multi-line paste reaches reedline as typed keys and is submitted at
+/// its first newline, with the rest still queued as input. Drain that rest and append it, so the paste stays one
+/// request instead of becoming one request per line.
+// ponytail: a 30 ms lull ends the paste, so a key typed within 30 ms of Enter joins the request; upgrade path: a
+// custom reedline `EditMode` that sees the whole input burst.
+fn with_pasted_rest(line: String) -> String {
+    if !cfg!(windows) {
+        return line;
+    }
+    let mut keys = Vec::new();
+    while event::poll(Duration::from_millis(30)).unwrap_or(false) {
+        match event::read() {
+            Ok(event::Event::Key(k)) => keys.push(k),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let rest = keys_to_text(&keys);
+    let rest = rest.trim_end_matches('\n');
+    if rest.is_empty() {
+        return line;
+    }
+    println!("{}", format!("  (+{} pasted lines)", rest.lines().count()).dim());
+    format!("{line}\n{rest}")
+}
+
+/// The text that console keys type: characters, Tab, and Enter as a newline. Key releases (Windows reports them)
+/// and keys that type nothing are dropped.
+fn keys_to_text(keys: &[KeyEvent]) -> String {
+    keys.iter()
+        .filter(|k| k.kind != KeyEventKind::Release)
+        .filter_map(|k| match k.code {
+            KeyCode::Enter => Some('\n'),
+            KeyCode::Tab => Some('\t'),
+            KeyCode::Char(c) if !c.is_control() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
 fn line_editor(root: &Path) -> Reedline {
     let mut keys = default_emacs_keybindings();
     keys.add_binding(KeyModifiers::ALT, KeyCode::Enter, ReedlineEvent::Edit(vec![EditCommand::InsertNewline]));
     let tab = ReedlineEvent::UntilFound(vec![ReedlineEvent::Menu("completion_menu".into()), ReedlineEvent::MenuNext]);
     keys.add_binding(KeyModifiers::NONE, KeyCode::Tab, tab);
-    let completer = DefaultCompleter::new_with_wordlen(SLASH_COMMANDS.map(String::from).to_vec(), 2);
     let editor = Reedline::create()
         .with_edit_mode(Box::new(Emacs::new(keys)))
-        .with_completer(Box::new(completer))
+        .with_completer(Box::new(slash_completer()))
         .with_menu(ReedlineMenu::EngineCompleter(Box::new(ColumnarMenu::default().with_name("completion_menu"))))
-        // crossterm has no paste event on Windows (crossterm#737; reedline recommends exactly this switch)
+        // crossterm has no paste event on Windows (crossterm#737; reedline recommends exactly this switch);
+        // `with_pasted_rest` keeps a multi-line paste together there
         .use_bracketed_paste(cfg!(not(windows)));
     match FileBackedHistory::with_file(HISTORY_SIZE, root.join("history.txt")) {
         Ok(history) => editor.with_history(Box::new(history)),
@@ -391,7 +446,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
     let mut tools = tool_ctx(ctx, &session);
     let code = loop {
         let line = match editor.read_line(&prompt) {
-            Ok(Signal::Success(line)) => line,
+            Ok(Signal::Success(line)) => with_pasted_rest(line),
             Ok(Signal::CtrlD) => break ExitCode::SUCCESS,
             Ok(_) => continue, // Ctrl+C: the line is dropped
             Err(e) => {
@@ -440,6 +495,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
                 None
             }
             Slash::Compact(focus) => {
+                CANCEL.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
                 let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL };
                 if let Err(e) = agent.compact(focus.as_deref()) {
                     agent.ui.notice(&e);
@@ -484,7 +540,7 @@ fn session_status(s: &Session, budget: usize) -> Status {
         Kind::Assistant { usage, tool_calls, .. } => Some((usage, tool_calls.len())),
         _ => None,
     });
-    let cached_pct = assistant().last().filter(|(u, _)| u.prompt > 0).map_or(0, |(u, _)| (u.cached * 100 / u.prompt).min(100) as u8);
+    let cached_pct = assistant().next_back().filter(|(u, _)| u.prompt > 0).map_or(0, |(u, _)| (u.cached * 100 / u.prompt).min(100) as u8);
     Status {
         ctx_tokens: policy::estimate_tokens(&s.events),
         budget,
@@ -681,5 +737,39 @@ mod tests {
         for name in SLASH_COMMANDS {
             assert!(!matches!(parse_slash(name), Some(Slash::Unknown(_)) | None), "{name}");
         }
+    }
+
+    #[test]
+    fn slash_commands_complete() {
+        use reedline::Completer;
+        let mut c = slash_completer();
+        let mut values = |line: &str| c.complete(line, line.len()).suggestions().iter().map(|s| s.value.clone()).collect::<Vec<_>>();
+        assert_eq!(values("/he"), ["/help"]);
+        assert_eq!(values("/c"), ["/clear", "/compact"]);
+        assert_eq!(values("/re"), ["/resume"]);
+        assert!(values("hel").is_empty());
+    }
+
+    #[test]
+    fn pasted_keys_become_text() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let release = |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release);
+        let shifted = KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT);
+        let keys = [
+            release(KeyCode::Enter), // the submitting Enter's release comes first
+            press(KeyCode::Char('a')),
+            release(KeyCode::Char('a')),
+            press(KeyCode::Enter),
+            press(KeyCode::Tab),
+            shifted,
+            press(KeyCode::Char(' ')),
+            press(KeyCode::Char('é')),
+            press(KeyCode::Left), // not text
+            press(KeyCode::Enter),
+        ];
+        assert_eq!(keys_to_text(&keys), "a\n\tB é\n");
+        assert_eq!(keys_to_text(&[release(KeyCode::Enter)]), "");
+        assert_eq!(keys_to_text(&[]), "");
     }
 }
