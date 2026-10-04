@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
@@ -23,6 +23,12 @@ const POLL: Duration = Duration::from_millis(50);
 const DRAIN: Duration = Duration::from_secs(2);
 /// Captured output is capped so a runaway command (`yes`) cannot exhaust memory.
 const MAX_CAPTURE: usize = 32 << 20;
+/// Git Bash on Windows delivers at most 8186 bytes of a `-c` string (measured on Git 2.53.0) and silently
+/// cuts the rest, so longer commands are refused. Non-ASCII text counts in bytes here: conservative.
+const WINDOWS_BASH_MAX_COMMAND: usize = 8000;
+/// Windows `CREATE_NEW_PROCESS_GROUP` process creation flag.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq)]
@@ -426,6 +432,14 @@ fn kill_tree(child: &mut Child) {
 pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cancel: &AtomicBool) -> Exec {
     let start = Instant::now();
     let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if cfg!(windows) && matches!(shell, Shell::Bash(_)) && cmd.len() > WINDOWS_BASH_MAX_COMMAND {
+        // Git Bash silently cuts a longer `-c` string and still runs the cut-off command: refuse instead.
+        let output = format!(
+            "command too long for Git Bash on Windows ({} bytes, limit {WINDOWS_BASH_MAX_COMMAND}); write it to a file with `write` and run that",
+            cmd.len()
+        );
+        return Exec { output, exit_code: None, timed_out: false, cancelled: false, duration_ms: elapsed_ms() };
+    }
     let mut command = shell_command(shell, cmd);
     command
         .current_dir(cwd)
@@ -436,6 +450,10 @@ pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cance
         .stderr(Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // Windows: the child would share our console and get Ctrl+C itself, dying (exit 130) before `cancel` is
+    // seen. A new process group makes it ignore Ctrl+C, so only `kill_tree` ends it.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NEW_PROCESS_GROUP);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -451,8 +469,8 @@ pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cance
     let deadline = start + timeout;
     let (mut out, mut truncated) = (Vec::new(), false);
     let mut readers_open = true;
-    let (mut timed_out, mut cancelled) = (false, false);
-    let status = loop {
+    let (mut exit_code, mut timed_out, mut cancelled) = (None, false, false);
+    loop {
         if readers_open {
             match rx.recv_timeout(POLL) {
                 Ok(chunk) => keep(&mut out, &mut truncated, &chunk),
@@ -463,15 +481,18 @@ pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cance
             thread::sleep(POLL);
         }
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => {
+                (exit_code, cancelled) = exit_result(status, cancel);
+                break;
+            }
             Ok(None) if cancel.load(Ordering::SeqCst) => cancelled = true,
             Ok(None) if Instant::now() >= deadline => timed_out = true,
             Ok(None) => continue,
             Err(_) => {} // cannot observe the child any more: kill it rather than wait forever
         }
         kill_tree(&mut child);
-        break None;
-    };
+        break;
+    }
 
     // Collect what the readers still hold, but never wait for them past DRAIN and never join them: a
     // background process may keep the pipes open for as long as it lives.
@@ -489,7 +510,13 @@ pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cance
         // ponytail: keeps only the head of a runaway output. Upgrade path: spill the rest to a file.
         output += &format!("\n[output limit reached: {MAX_CAPTURE} bytes kept, the rest was discarded]");
     }
-    Exec { output, exit_code: status.and_then(|s| s.code()), timed_out, cancelled, duration_ms: elapsed_ms() }
+    Exec { output, exit_code, timed_out, cancelled, duration_ms: elapsed_ms() }
+}
+
+/// `(exit code, cancelled)` for a child that ended by itself. If `cancel` is set the run counts as cancelled
+/// and has no exit code: a Ctrl+C can make the child exit (e.g. 130) before the poll loop sees the flag.
+fn exit_result(status: ExitStatus, cancel: &AtomicBool) -> (Option<i32>, bool) {
+    if cancel.load(Ordering::SeqCst) { (None, true) } else { (status.code(), false) }
 }
 
 /// `timeout` seconds, default 120, clamped to 1..=600 (fractions are dropped).
@@ -828,6 +855,54 @@ mod tests {
         assert!(e.cancelled && !e.timed_out, "{e:?}");
         assert_eq!(e.exit_code, None);
         assert!(e.duration_ms < 5000, "{}", e.duration_ms);
+    }
+
+    #[test]
+    fn natural_exit_racing_a_cancel_counts_as_cancelled() {
+        let Some(sh) = git_bash() else { return };
+        // a Ctrl+C can make bash exit (130) before the poll loop sees the cancel flag
+        let status = shell_command(&sh, "exit 130").stdin(Stdio::null()).status().unwrap();
+        assert_eq!(exit_result(status, &AtomicBool::new(false)), (Some(130), false));
+        assert_eq!(exit_result(status, &AtomicBool::new(true)), (None, true));
+
+        // end to end: whichever way the loop notices it (exit or flag first), the flag wins
+        let e = exec_shell(&sh, "exit 130", &test_dir("exec-race"), Duration::from_secs(10), &AtomicBool::new(true));
+        assert!(e.cancelled && !e.timed_out && e.exit_code.is_none(), "{e:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bash_refuses_overlong_command_instead_of_running_it_cut() {
+        let Some(sh) = git_bash() else { return };
+        let dir = test_dir("exec-long");
+        let marker = |d: &Path| d.join("marker");
+        let pad = |total: usize| {
+            let head = "echo ran\n# ";
+            let tail = "\ntouch marker";
+            format!("{head}{}{tail}", "x".repeat(total - head.len() - tail.len()))
+        };
+
+        let long = pad(8500);
+        assert_eq!(long.len(), 8500);
+        let e = run_in(&sh, &dir, &long, 10);
+        assert!(e.output.starts_with("command too long for Git Bash on Windows"), "{:?}", e.output);
+        assert!(e.output.contains("write it to a file with `write` and run that"), "{:?}", e.output);
+        assert!(e.exit_code.is_none() && !e.timed_out && !e.cancelled, "{e:?}");
+        assert!(!e.output.contains("ran"), "nothing may run: {:?}", e.output);
+        assert!(!marker(&dir).exists(), "the tail of the command ran");
+
+        // through the tool: a failed result
+        let mut c = ctx("bash-tool-long");
+        c.shell = sh.clone();
+        let o = bash(&mut c, &json!({ "command": long }), &AtomicBool::new(false));
+        assert!(!o.ok && o.exit_code.is_none() && o.text.contains("command too long"), "{o:?}");
+
+        // exactly at the limit: delivered whole, so the last line runs
+        let fits = pad(WINDOWS_BASH_MAX_COMMAND);
+        assert_eq!(fits.len(), WINDOWS_BASH_MAX_COMMAND);
+        let e = run_in(&sh, &dir, &fits, 10);
+        assert_eq!(e.exit_code, Some(0), "{:?}", clip(&e.output, 200));
+        assert!(e.output.contains("ran") && marker(&dir).exists(), "{:?}", e.output);
     }
 
     #[test]
