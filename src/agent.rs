@@ -1244,4 +1244,38 @@ mod tests {
         assert_eq!(summary_calls(&m), 2);
         assert_eq!(stages(&session.events), [2]);
     }
+
+    /// One real request against the API: `cargo test live_hello -- --ignored --nocapture`. The key comes from where the
+    /// binary reads it (the env var, else the Windows User scope); without one the test is skipped.
+    #[test]
+    #[ignore]
+    fn live_hello() {
+        use crate::llm::{ZaiClient, ZaiConfig};
+        use crate::ui::Headless;
+        let cfg = crate::Config::default();
+        let Some(api_key) = crate::api_key(&cfg.api_key_env) else {
+            eprintln!("live_hello skipped: {} is not set", cfg.api_key_env);
+            return;
+        };
+        let root = test_dir("live");
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        let ctx = crate::Ctx { root: root.join("home"), cwd, shell: tools::resolve_shell(), model: cfg.model.clone(), budget: cfg.context_budget, allow: vec![] };
+        let session = crate::new_session(&ctx, Mode::Yolo).unwrap();
+        let (perms, tools) = (Perms::new(Mode::Yolo, true, session.dir.clone(), vec![]), crate::tool_ctx(&ctx, &session));
+        let mut model = ZaiClient::new(ZaiConfig {
+            base_url: cfg.base_url,
+            model: cfg.model,
+            api_key,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+            reasoning_effort: cfg.reasoning_effort,
+        });
+        let (mut ui, cancel) = (Headless { out: Vec::new() }, AtomicBool::new(false));
+        let mut a = Agent { session, model: &mut model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &cancel };
+        let outcome = a.run_request("Create a file named hello.txt containing exactly: hi");
+        eprintln!("session: {}", a.session.dir.display());
+        assert_eq!(outcome, Outcome::Done, "{}", String::from_utf8_lossy(&ui.out));
+        assert_eq!(fs::read_to_string(ctx.cwd.join("hello.txt")).unwrap().trim(), "hi");
+    }
 }
