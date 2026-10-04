@@ -64,7 +64,8 @@ bench/
   "verify": ["{python} -m unittest discover -s verify -v"],
   "timeout_s": 600,
   "verify_timeout_s": 120,
-  "budget": null
+  "budget": null,
+  "requires": []
 }
 ```
 
@@ -73,6 +74,7 @@ bench/
   - They run through `bash -c` when Git Bash is present, otherwise through `cmd /c`.
   - The task passes only if every command exits 0.
 - `budget`, when set, is passed as `--budget` to Xolotl. It overrides the runner's `--budget`.
+- `requires` lists executables the task needs (e.g. `["cargo"]`). If any is missing from PATH, the task is `skipped`.
 - `repo/` must not contain the hidden checks. A task may include visible tests in `repo/` as hints. The hidden checks in `verify/` are what decide the result.
 
 ## 5. Runner (`bench/run.py`)
