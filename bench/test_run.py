@@ -109,10 +109,12 @@ class Pure(unittest.TestCase):
     def test_metrics_tolerate_garbage_lines(self):
         lines = ["", "not json", '{"type":"assistant"', b"\xff".decode("latin-1"), "[1,2]", "7", "null",
                  "[" * 200_000,  # deep nesting raises RecursionError, not ValueError
-                 ev("assistant", usage=None), assistant(5, 6, 7)]
+                 ev("assistant", usage=None), assistant(5, 6, 7),
+                 ev("compaction", stage=1.0), ev("compaction", stage=[1]), ev("compaction", stage=3)]
         m = run.metrics_from_events(lines)
         self.assertEqual(m["model_calls"], 2)
         self.assertEqual(m["tokens"], {"prompt": 5, "completion": 6, "cached": 7})
+        self.assertEqual(m["compactions"], {"stage1": 0, "stage2": 0})  # odd stage values are ignored, not a crash
         self.assertEqual(run.metrics_from_events(iter([])), run.metrics_from_events([]))  # any iterable
 
     def test_session_dir_picks_newest(self):

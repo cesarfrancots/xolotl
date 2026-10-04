@@ -87,7 +87,7 @@ def metrics_from_events(lines: Iterable[str]) -> dict:
                 m["tokens"][k] += _count(ev.get("usage"), k)
         elif kind == "tool_result":
             m["tool_calls"] += 1
-        elif kind == "compaction" and ev.get("stage") in (1, 2):
+        elif kind == "compaction" and _is_int(ev.get("stage")) and ev["stage"] in (1, 2):
             m["compactions"][f"stage{ev['stage']}"] += 1
         elif kind == "nudge" and ev.get("reason") == "completion_check":
             m["completion_check"] = True
