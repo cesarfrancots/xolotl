@@ -53,7 +53,7 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "git branch: $(git branch --show-current)"; echo "git status:"; git status --short | head -20
   echo "recent commits:"; git log --oneline -5
 else echo "git: not a repository"; fi
-echo "top-level:"; ls -A | head -30
+echo "top-level:"; ls -A | head -30; n=$(ls -A | wc -l); [ $n -gt 30 ] && echo "($(( $n - 30 )) more)"
 echo "manifests and implied commands:"
 [ -f Cargo.toml ] && echo "  Cargo.toml → cargo build / cargo test"
 [ -f package.json ] && { echo "  package.json scripts:"; grep -A15 '"scripts"' package.json | head -15; }
@@ -73,7 +73,7 @@ if ($LASTEXITCODE -eq 0) {
   "git branch: $(git branch --show-current)"; "git status:"; git status --short | Select-Object -First 20
   "recent commits:"; git log --oneline -5
 } else { "git: not a repository" }
-"top-level:"; Get-ChildItem -Force | Select-Object -First 30 -ExpandProperty Name
+"top-level:"; $top = @(Get-ChildItem -Force); $top | Select-Object -First 30 -ExpandProperty Name; if ($top.Count -gt 30) { "($($top.Count - 30) more)" }
 "manifests and implied commands:"
 if (Test-Path Cargo.toml) { "  Cargo.toml -> cargo build / cargo test" }
 if (Test-Path package.json) { "  package.json scripts:"; Select-String -Path package.json -Pattern '"scripts"' -Context 0,15 | Select-Object -First 1 | ForEach-Object { $_.Line; $_.Context.PostContext } }
@@ -569,8 +569,12 @@ mod tests {
         for shell in [Shell::Bash(PathBuf::from("bash")), Shell::Sh] {
             let c = env_snapshot_command(&shell);
             assert!(c.contains("git status --short") && c.contains("head -20"));
+            // the top-level listing says how many entries it left out
+            assert!(c.contains("ls -A | head -30") && c.contains(r#"[ $n -gt 30 ] && echo "($(( $n - 30 )) more)""#), "{c}");
         }
-        assert!(env_snapshot_command(&Shell::PowerShell).contains("Get-Location"));
+        let ps = env_snapshot_command(&Shell::PowerShell);
+        assert!(ps.contains("Get-Location"));
+        assert!(ps.contains(r#"if ($top.Count -gt 30) { "($($top.Count - 30) more)" }"#), "{ps}");
     }
 
     #[test]

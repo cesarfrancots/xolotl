@@ -1,5 +1,6 @@
-//! File tools `read`, `write`, `edit` (spec §7, §7.1), shell selection and the `bash` tool (§7.2), and the
-//! char-boundary-safe `clip` helpers.
+//! The seven tools (spec §7): `read`, `write`, `edit` (§7.1), `glob`, `grep`, `bash` (with shell selection and
+//! process-tree-safe execution, §7.2) and `todo`; their schemas and the `run` dispatcher; and the char-boundary-safe
+//! `clip` helpers.
 
 use globset::Glob;
 use regex::Regex;
@@ -46,6 +47,8 @@ pub struct ToolCtx {
     pub backups_dir: PathBuf,
     /// Files read this session, keyed by `fs::canonicalize(path)`, with the mtime seen at read time.
     pub reads: HashMap<PathBuf, SystemTime>,
+    /// Environment variables no tool shell may see (the API key's), even if a login profile would set them again.
+    pub secret_env: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -429,9 +432,22 @@ fn kill_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// The command `shell` actually runs, and the variables removed from its environment, for the secret names in `scrub`.
+/// Off Windows, `bash -lc` sources the login profile, which may export a removed variable again, so POSIX shells
+/// also `unset` it first; only names of the form `[A-Za-z_][A-Za-z0-9_]*` go into that command line.
+fn scrub_plan<'a>(shell: &Shell, cmd: &str, scrub: &'a [String], windows: bool) -> (String, Vec<&'a str>) {
+    let removed: Vec<&str> = scrub.iter().map(String::as_str).filter(|n| !n.is_empty() && !n.contains(['=', '\0'])).collect();
+    let shell_name = |n: &&str| n.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let unset: Vec<&str> = removed.iter().copied().filter(shell_name).collect();
+    let posix = matches!(shell, Shell::Bash(_) | Shell::Sh) && !windows;
+    let cmd = if posix && !unset.is_empty() { format!("unset {}; {cmd}", unset.join(" ")) } else { cmd.to_string() };
+    (cmd, removed)
+}
+
 /// Runs `cmd` in a fresh `shell` process in `cwd` (stdin closed) until it exits, `timeout` passes, or `cancel`
-/// is set; the last two kill the whole process tree and keep the partial output.
-pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cancel: &AtomicBool) -> Exec {
+/// is set; the last two kill the whole process tree and keep the partial output. The variables named in `scrub`
+/// never reach it.
+pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cancel: &AtomicBool, scrub: &[String]) -> Exec {
     let start = Instant::now();
     let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     if cfg!(windows) && matches!(shell, Shell::Bash(_)) && cmd.len() > WINDOWS_BASH_MAX_COMMAND {
@@ -442,7 +458,11 @@ pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cance
         );
         return Exec { output, exit_code: None, timed_out: false, cancelled: false, duration_ms: elapsed_ms() };
     }
-    let mut command = shell_command(shell, cmd);
+    let (cmd, removed) = scrub_plan(shell, cmd, scrub, cfg!(windows));
+    let mut command = shell_command(shell, &cmd);
+    for name in removed {
+        command.env_remove(name);
+    }
     command
         .current_dir(cwd)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -533,7 +553,7 @@ pub(crate) fn bash(ctx: &mut ToolCtx, args: &Value, cancel: &AtomicBool) -> Tool
         Err(e) => return ToolOut::err(e),
     };
     let timeout = bash_timeout(args);
-    let e = exec_shell(&ctx.shell, cmd, &ctx.root, timeout, cancel);
+    let e = exec_shell(&ctx.shell, cmd, &ctx.root, timeout, cancel, &ctx.secret_env);
     let secs = e.duration_ms as f64 / 1000.0;
     let footer = match e.exit_code {
         _ if e.cancelled => "\n[cancelled by user]".to_string(),
@@ -725,7 +745,7 @@ fn todo_impl(args: &Value) -> Result<String, String> {
             let mark = match str_arg(item, "status").map_err(at)? {
                 "pending" => "[ ]",
                 "in_progress" => "[>]",
-                "done" => "[x]",
+                "done" | "completed" => "[x]",
                 other => return Err(at(format!("invalid status `{other}`; use pending, in_progress or done"))),
             };
             Ok(format!("{mark} {text}"))
@@ -836,7 +856,7 @@ mod tests {
 
     fn ctx(tag: &str) -> ToolCtx {
         let root = test_dir(tag);
-        ToolCtx { backups_dir: root.join(".bk"), root, shell: Shell::Sh, reads: HashMap::new() }
+        ToolCtx { backups_dir: root.join(".bk"), root, shell: Shell::Sh, reads: HashMap::new(), secret_env: vec![] }
     }
     fn put(c: &ToolCtx, name: &str, bytes: impl AsRef<[u8]>) {
         fs::write(c.root.join(name), bytes).unwrap();
@@ -1100,7 +1120,7 @@ mod tests {
         Some(resolve_shell()).filter(|s| matches!(s, Shell::Bash(_)))
     }
     fn run_in(sh: &Shell, dir: &Path, cmd: &str, secs: u64) -> Exec {
-        exec_shell(sh, cmd, dir, Duration::from_secs(secs), &AtomicBool::new(false))
+        exec_shell(sh, cmd, dir, Duration::from_secs(secs), &AtomicBool::new(false), &[])
     }
     fn run(sh: &Shell, cmd: &str, secs: u64) -> Exec {
         run_in(sh, &test_dir("exec"), cmd, secs)
@@ -1135,7 +1155,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(300));
                 cancel.store(true, Ordering::SeqCst);
             });
-            exec_shell(&sh, "sleep 30", &dir, Duration::from_secs(20), &cancel)
+            exec_shell(&sh, "sleep 30", &dir, Duration::from_secs(20), &cancel, &[])
         });
         assert!(e.cancelled && !e.timed_out, "{e:?}");
         assert_eq!(e.exit_code, None);
@@ -1151,7 +1171,7 @@ mod tests {
         assert_eq!(exit_result(status, &AtomicBool::new(true)), (None, true));
 
         // end to end: whichever way the loop notices it (exit or flag first), the flag wins
-        let e = exec_shell(&sh, "exit 130", &test_dir("exec-race"), Duration::from_secs(10), &AtomicBool::new(true));
+        let e = exec_shell(&sh, "exit 130", &test_dir("exec-race"), Duration::from_secs(10), &AtomicBool::new(true), &[]);
         assert!(e.cancelled && !e.timed_out && e.exit_code.is_none(), "{e:?}");
     }
 
@@ -1272,6 +1292,37 @@ mod tests {
         let o = bash(&mut c, &json!({ "command": "sleep 5", "timeout": 1 }), &AtomicBool::new(false));
         assert!(!o.ok && !o.cancelled && o.exit_code.is_none(), "{o:?}");
         assert!(o.text.contains("[timed out after 1s · partial output above]"), "{:?}", o.text);
+    }
+
+    #[test]
+    fn secrets_are_scrubbed_from_tool_shells() {
+        let scrub = vec!["XOLOTL_TEST_SECRET".to_string(), "_K2".to_string(), "BAD-NAME".to_string(), "X;rm -rf /".to_string(), String::new()];
+        let bash = Shell::Bash(PathBuf::from("bash"));
+        // POSIX shells off Windows: `bash -lc` sources the login profile, which may export the key again, so it is unset
+        // first; only well-formed names go into the command line. Every usable name is removed from the environment.
+        let removed = vec!["XOLOTL_TEST_SECRET", "_K2", "BAD-NAME", "X;rm -rf /"];
+        for shell in [&bash, &Shell::Sh] {
+            assert_eq!(scrub_plan(shell, "echo hi", &scrub, false), ("unset XOLOTL_TEST_SECRET _K2; echo hi".to_string(), removed.clone()));
+        }
+        // Windows Git Bash runs `-c` without a login profile, and PowerShell never sources one: the command is unchanged
+        assert_eq!(scrub_plan(&bash, "echo hi", &scrub, true), ("echo hi".to_string(), removed.clone()));
+        assert_eq!(scrub_plan(&Shell::PowerShell, "echo hi", &scrub, false), ("echo hi".to_string(), removed));
+        // nothing to scrub, or nothing safe to put on the command line: no prefix
+        assert_eq!(scrub_plan(&bash, "echo hi", &[], false), ("echo hi".to_string(), vec![]));
+        assert_eq!(scrub_plan(&bash, "echo hi", &["1X".to_string()], false), ("echo hi".to_string(), vec!["1X"]));
+    }
+
+    #[test]
+    fn scrubbed_variable_does_not_reach_the_shell() {
+        let Some(sh) = git_bash() else { return };
+        // a variable this process has (tests must not set one: that races the other threads); the shell must not see it
+        let name = if cfg!(windows) { "PROCESSOR_ARCHITECTURE" } else { "PATH" };
+        if std::env::var_os(name).is_none() {
+            return;
+        }
+        let cmd = format!("echo \"${{{name}-unset}}\"");
+        let e = exec_shell(&sh, &cmd, &test_dir("scrub"), Duration::from_secs(10), &AtomicBool::new(false), &[name.to_string()]);
+        assert_eq!(e.output.trim(), "unset", "{e:?}");
     }
 
     #[test]
@@ -1445,6 +1496,10 @@ mod tests {
         assert_eq!(call(&mut c, "todo", json!({})).text, "missing argument `items`");
         // the list is replaced wholesale, so an empty one is valid
         assert_eq!(call(&mut c, "todo", json!({ "items": [] })).text, "(empty todo list)");
+        // `completed` is a common alias for `done`
+        let o = call(&mut c, "todo", json!({ "items": [{ "text": "a", "status": "completed" }] }));
+        assert!(o.ok, "{}", o.text);
+        assert_eq!(o.text, "[x] a");
     }
 
     #[test]

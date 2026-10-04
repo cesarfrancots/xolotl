@@ -233,6 +233,8 @@ struct Ctx {
     budget: usize,
     /// `--allow` prefixes.
     allow: Vec<String>,
+    /// Name of the variable that holds the API key: named in auth errors, kept out of every tool shell.
+    api_key_env: String,
 }
 
 fn main() -> ExitCode {
@@ -263,7 +265,15 @@ fn run() -> Result<ExitCode, String> {
     // the permission checks resolve relative paths against the process cwd
     env::set_current_dir(&cwd).map_err(|e| format!("cannot enter {}: {e}", cwd.display()))?;
     ctrlc::set_handler(|| CANCEL.store(true, Ordering::SeqCst)).map_err(|e| format!("cannot handle Ctrl+C: {e}"))?;
-    let ctx = Ctx { root, cwd, shell: tools::resolve_shell(), model: cfg.model.clone(), budget: cfg.context_budget, allow: args.allow.clone() };
+    let ctx = Ctx {
+        root,
+        cwd,
+        shell: tools::resolve_shell(),
+        model: cfg.model.clone(),
+        budget: cfg.context_budget,
+        allow: args.allow.clone(),
+        api_key_env: cfg.api_key_env.clone(),
+    };
 
     if args.prompt.is_none() {
         // before the session: the environment snapshot can take seconds
@@ -313,7 +323,8 @@ fn new_session(ctx: &Ctx, mode: Mode) -> Result<Session, String> {
     CANCEL.store(false, Ordering::SeqCst); // a Ctrl+C from before must not cut the snapshot; a new one may
     let timeout = Duration::from_secs(policy::LIMITS.snapshot_timeout_s);
     // fails silently: on an error or a timeout the snapshot is just shorter
-    let snapshot = tools::exec_shell(&ctx.shell, &policy::env_snapshot_command(&ctx.shell), &ctx.cwd, timeout, &CANCEL).output;
+    let scrub = std::slice::from_ref(&ctx.api_key_env);
+    let snapshot = tools::exec_shell(&ctx.shell, &policy::env_snapshot_command(&ctx.shell), &ctx.cwd, timeout, &CANCEL, scrub).output;
     let agents_md = fs::read_to_string(ctx.cwd.join("AGENTS.md")).ok();
     let now = store::now_ms();
     let meta = Meta {
@@ -348,7 +359,13 @@ fn by_id(sessions: Vec<PathBuf>, id: &str) -> Result<PathBuf, String> {
 }
 
 fn tool_ctx(ctx: &Ctx, s: &Session) -> ToolCtx {
-    ToolCtx { root: ctx.cwd.clone(), shell: ctx.shell.clone(), backups_dir: s.artifacts_dir(), reads: HashMap::new() }
+    ToolCtx {
+        root: ctx.cwd.clone(),
+        shell: ctx.shell.clone(),
+        backups_dir: s.artifacts_dir(),
+        reads: HashMap::new(),
+        secret_env: vec![ctx.api_key_env.clone()],
+    }
 }
 
 /// `-p`: one request, every event as a JSON line on stdout. Exit 0 when the agent finished, 2 at the step limit,
@@ -358,7 +375,7 @@ fn headless(ctx: &Ctx, session: Session, model: &mut ZaiClient, mode: Mode, task
     let mut ui = Headless { out: io::stdout() };
     let perms = Perms::new(mode, true, session.dir.clone(), ctx.allow.clone());
     let tools = tool_ctx(ctx, &session);
-    let mut agent = Agent { session, model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &CANCEL };
+    let mut agent = Agent { session, model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
     let (status, code) = match agent.run_request(task) {
         Outcome::Done => ("done", 0),
         Outcome::StepLimit => ("step_limit", 2),
@@ -465,7 +482,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
         }
         // The agent owns the session, permissions and tool state while it runs, and hands them back after.
         let Some(cmd) = parse_slash(&line) else {
-            let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL };
+            let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
             agent.run_request(&line);
             Agent { session, perms, tools, .. } = agent;
             println!();
@@ -502,7 +519,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
             }
             Slash::Compact(focus) => {
                 CANCEL.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
-                let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL };
+                let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
                 if let Err(e) = agent.compact(focus.as_deref()) {
                     agent.ui.notice(&e);
                 }

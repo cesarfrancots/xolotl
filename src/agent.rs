@@ -17,6 +17,8 @@ const HEADLESS_DENIED: &str = "denied: not allowed in headless mode (use --mode 
 const EMPTY_NUDGE: &str = "(empty response — continue the task, or reply with your answer)";
 /// Lines of an edit/write diff shown in a permission prompt.
 const DIFF_LINES: usize = 20;
+/// Tool output longer than this (bytes) is also saved to `artifacts/<call-id>.txt`, so its stage-1 stub has a `full:` path.
+const ARTIFACT_MIN: usize = 1536;
 
 pub struct Agent<'a> {
     pub session: Session,
@@ -26,6 +28,8 @@ pub struct Agent<'a> {
     pub tools: ToolCtx,
     pub budget: usize,
     pub cancel: &'a AtomicBool,
+    /// Named in the auth error (spec §12: "check <api_key_env>").
+    pub api_key_env: &'a str,
 }
 
 #[derive(Debug, PartialEq)]
@@ -225,7 +229,7 @@ impl Agent<'_> {
                 }
                 Err(e) => {
                     let msg = match e {
-                        LlmError::Auth(_) => "authentication failed — check ZAI_API_KEY".to_string(),
+                        LlmError::Auth(_) => format!("authentication failed — check {}", self.api_key_env),
                         _ => e.to_string(),
                     };
                     self.append(Kind::Error { kind: "llm".into(), message: e.to_string(), retry: false })?;
@@ -322,13 +326,15 @@ impl Agent<'_> {
         let out = tools::run(&mut self.tools, &call.name, &call.id, &args, self.cancel);
         let duration_ms = t0.elapsed().as_millis() as u64;
         let capped = policy::cap_output(&call.name, &out.text);
-        let (output, artifact) = if !capped.truncated {
-            (capped.text, None)
-        } else {
-            match self.session.write_artifact(&format!("{}.txt", call.id), out.text.as_bytes()) {
-                Ok(path) => (capped.text + &truncation_note(out.text.len(), &path), Some(path.display().to_string())),
-                Err(e) => (format!("{}\n[truncated: the full output could not be saved: {e}]", capped.text), None),
-            }
+        // A stage-1 stub can only point at the full text if it is saved: following `events.jsonl seq N` instead gives
+        // lines cut by `read`/`grep`. So every result past ARTIFACT_MIN is saved, not only a truncated one.
+        let saved = (capped.truncated || out.text.len() > ARTIFACT_MIN).then(|| self.session.write_artifact(&format!("{}.txt", call.id), out.text.as_bytes()));
+        let (output, artifact) = match saved {
+            None => (capped.text, None),
+            Some(Ok(path)) if capped.truncated => (capped.text + &truncation_note(out.text.len(), &path), Some(path.display().to_string())),
+            Some(Ok(path)) => (capped.text, Some(path.display().to_string())),
+            Some(Err(e)) if capped.truncated => (format!("{}\n[truncated: the full output could not be saved: {e}]", capped.text), None),
+            Some(Err(_)) => (capped.text, None), // the result itself is whole; only its stub will lack a `full:` path
         };
         self.append(Kind::ToolResult {
             call_id: call.id.clone(),
@@ -515,9 +521,9 @@ mod tests {
         session
             .append(Kind::SessionStart { cwd, model: "m".into(), mode: mode.as_str().into(), policy_hash: "h".into(), system: "S".into() })
             .unwrap();
-        let tools = ToolCtx { root: proj, shell: tools::resolve_shell(), backups_dir: session.artifacts_dir(), reads: HashMap::new() };
+        let tools = ToolCtx { root: proj, shell: tools::resolve_shell(), backups_dir: session.artifacts_dir(), reads: HashMap::new(), secret_env: vec![] };
         let perms = Perms::new(mode, headless, session.dir.clone(), vec![]);
-        Agent { session, model, ui, perms, tools, budget: 200_000, cancel }
+        Agent { session, model, ui, perms, tools, budget: 200_000, cancel, api_key_env: "XOLOTL_TEST_KEY" }
     }
 
     fn has_bash() -> bool {
@@ -942,6 +948,39 @@ mod tests {
     }
 
     #[test]
+    fn mid_size_output_gets_an_artifact() {
+        // a 2 KB read (under the 30 KB cap) and a small one
+        let mut m = Scripted::new(vec![calls(vec![tc("c1", "read", r#"{"path":"a.txt"}"#), tc("c2", "read", r#"{"path":"b.txt"}"#)]), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("midsize", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        fs::write(a.tools.root.join("a.txt"), "x".repeat(2_000)).unwrap();
+        fs::write(a.tools.root.join("b.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("read them"), Outcome::Done);
+        let session = a.session;
+
+        let found: Vec<(u64, String, Option<String>)> = session
+            .events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::ToolResult { output, artifact, .. } => Some((e.seq, output.clone(), artifact.clone())),
+                _ => None,
+            })
+            .collect();
+        let (seq, output, artifact) = &found[0];
+        let artifact = artifact.as_ref().expect("a result over 1.5 KB has an artifact");
+        assert_eq!(Path::new(artifact), session.artifacts_dir().join("c1.txt"));
+        assert_eq!(&fs::read_to_string(artifact).unwrap(), output, "not truncated: the artifact is the whole output");
+        assert!(!output.contains("[truncated"), "only truncated output gets the note");
+        assert_eq!(found[1].2, None, "a small result has none");
+        // so its stage-1 stub points at the full text
+        let stubs: Vec<String> = policy::render(&session.events, 0, *seq)
+            .into_iter()
+            .filter_map(|m| if let Message::Tool { call_id, content } = m { (call_id == "c1").then_some(content) } else { None })
+            .collect();
+        assert_eq!(stubs, [format!("[elided: 2KB read output — events.jsonl seq {seq}; full: {artifact}]")]);
+    }
+
+    #[test]
     fn truncation_note_format() {
         assert_eq!(truncation_note(1, Path::new("/s/artifacts/c1.txt")), "\n[truncated: full output 1KB at /s/artifacts/c1.txt — use read/grep]");
         assert_eq!(truncation_note(2048, Path::new("p")), "\n[truncated: full output 2KB at p — use read/grep]");
@@ -966,7 +1005,8 @@ mod tests {
         let mut m = Scripted::new(vec![Err(LlmError::Auth("HTTP 401: no".into()))]);
         let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
         let mut a = agent("auth", Mode::Writes, false, &mut m, &mut ui, &cancel);
-        assert_eq!(a.run_request("go"), Outcome::Error("authentication failed — check ZAI_API_KEY".into()));
+        // the configured variable's name, not the default's
+        assert_eq!(a.run_request("go"), Outcome::Error("authentication failed — check XOLOTL_TEST_KEY".into()));
     }
 
     #[test]
@@ -1276,7 +1316,7 @@ mod tests {
         assert!(stages(&session.events).is_empty());
 
         // the latch is per request
-        let mut a = Agent { session, model: &mut m, ui: &mut ui, perms, tools, budget: 3_000, cancel: &cancel };
+        let mut a = Agent { session, model: &mut m, ui: &mut ui, perms, tools, budget: 3_000, cancel: &cancel, api_key_env: "XOLOTL_TEST_KEY" };
         assert_eq!(a.run_request("again"), Outcome::Done);
         let session = a.session;
         assert_eq!(m.requests.len(), 7);
@@ -1299,7 +1339,7 @@ mod tests {
         let root = test_dir("live");
         let cwd = root.join("proj");
         fs::create_dir_all(&cwd).unwrap();
-        let ctx = crate::Ctx { root: root.join("home"), cwd, shell: tools::resolve_shell(), model: cfg.model.clone(), budget: cfg.context_budget, allow: vec![] };
+        let ctx = crate::Ctx { root: root.join("home"), cwd, shell: tools::resolve_shell(), model: cfg.model.clone(), budget: cfg.context_budget, allow: vec![], api_key_env: cfg.api_key_env.clone() };
         let session = crate::new_session(&ctx, Mode::Yolo).unwrap();
         let (perms, tools) = (Perms::new(Mode::Yolo, true, session.dir.clone(), vec![]), crate::tool_ctx(&ctx, &session));
         let mut model = ZaiClient::new(ZaiConfig {
@@ -1311,7 +1351,7 @@ mod tests {
             reasoning_effort: cfg.reasoning_effort,
         });
         let (mut ui, cancel) = (Headless { out: Vec::new() }, AtomicBool::new(false));
-        let mut a = Agent { session, model: &mut model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &cancel };
+        let mut a = Agent { session, model: &mut model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &cancel, api_key_env: &ctx.api_key_env };
         let outcome = a.run_request("Create a file named hello.txt containing exactly: hi");
         eprintln!("session: {}", a.session.dir.display());
         assert_eq!(outcome, Outcome::Done, "{}", String::from_utf8_lossy(&ui.out));
