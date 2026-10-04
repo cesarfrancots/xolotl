@@ -11,6 +11,7 @@ py bench/run.py --selfcheck                          # no model calls: every tas
 py bench/run.py --repeat 3 --note "v1 baseline"      # full suite, 3 attempts per task (builds with cargo first)
 py bench/run.py --tasks py-offbyone --keep           # one task; --keep leaves each attempt's temp dir behind
 py bench/run.py --xolotl path\to\xolotl.exe          # use a ready binary instead of building (a .py file works too)
+py bench/run.py --fingerprint                        # print each task's hash and the suite hash; no build, no model calls
 py -m unittest bench.test_run -v                     # tests for the runner itself
 ```
 
@@ -21,8 +22,22 @@ Each run writes `results/<run_id>.json` (`run_id` = `YYYYMMDD-HHMM-<sha7>`, with
 already exists, so a run never overwrites another) and appends one row to `results/HISTORY.md`. Ctrl+C, or an error
 in the runner itself, stops the run, writes the finished attempts with `"partial": true` (plus an `error` message for
 an error), and adds no history row. `dirty` is the state of the source tree when the run started, ignoring
-`bench/results/`. A failed attempt's temp directory is kept and its path recorded (`kept_dir`); the hidden `verify/`
-is removed from it. The session trace stays in `~/.xolotl/` (`session_dir`).
+`bench/results/`; a dirty run's HISTORY row says `(dirty)` after its run id. A failed attempt's temp directory is kept
+and its path recorded (`kept_dir`); the hidden `verify/` is removed from it. The session trace stays in `~/.xolotl/`
+(`session_dir`).
+
+Each results file also records what the run was made of, so two runs can be compared like for like: `git_sha`,
+`policy_hash` (from Xolotl's `session_start`), `tasks_hash` (see below), `xolotl_version`, `xolotl_source` (`built`, or
+the `--xolotl` path) and `xolotl_config` (the parsed `~/.xolotl/config.json`, or null if there is none; it holds no
+secret, since Xolotl rejects unknown fields and reads the key from an environment variable).
+
+`policy_hash` hashes the bytes of `src/policy.rs`, so it, and every comparison across checkouts, assumes LF line
+endings. The repo's `.gitattributes` (`* text=auto eol=lf`) makes Windows checkouts use LF despite `core.autocrlf`.
+
+`tasks_hash` fingerprints the suite that ran: a SHA-256 (12 hex) over each selected task's `task_hash`, which covers
+`task.json`, `repo/` and `verify/` (paths and bytes, CRLF read as LF; not `solution/`). It's in each attempt (`task_hash`),
+in each run, and in the HISTORY `Tasks` column; if it differs between two runs, the tasks changed and the pass rates
+aren't comparable. `--fingerprint` prints the same hashes without running anything.
 
 ## Add a task
 
@@ -49,9 +64,19 @@ Per attempt, from Xolotl's JSON-lines events: `pass` (every verify command exite
 (`prompt` / `completion` / `cached`, summed from `assistant.usage`), `compactions` (`stage1` / `stage2` counts),
 `completion_check` (a `completion_check` nudge happened), `errors` (`error` events), `policy_hash` and `model` (from
 `session_start`), `verify_output` and `stderr_tail` (last 2 KB of the checks' output, last 1 KB of Xolotl's stderr).
-`status` is `pass`, `fail` or `skipped`; skipped attempts count in `total` but not in `pass_rate`.
+`status` is `pass`, `fail`, `skipped` or `infra_error`.
+
+- `infra_error` means the attempt says nothing about the agent: no `session_start` event at all (for example the API key
+  variable is not set), or an `error` event of kind `llm` that isn't retried (quota, auth, network, HTTP). `infra_reason`
+  says which; `stderr_tail` usually says why. A context-overflow error doesn't count (the agent compacts and retries, or
+  fails by its own context management), and an attempt whose checks passed stays `pass`.
+- `skipped` and `infra_error` attempts count in `total` but not in the pass rate, `per_task` denominators or wall-time
+  figures. A task's `per_task` entry reads like `2/2 (+1 infra)`; `summary.infra_errors` counts them.
+- The run still gets its HISTORY row, with the pass cell flagged, for example `2/3 (66.7%) ⚠1 infra`, and the runner
+  prints a warning. Re-run the affected tasks before trusting such a row.
 
 `summary` totals these per run: pass count and rate, `per_task` as `k/N`, summed tokens, median and total wall time.
+The HISTORY columns are: Date, Run, Policy (first 8 of `policy_hash`), Tasks (`tasks_hash`), Pass, Tokens, Median wall, Note.
 
 ## Task notes
 

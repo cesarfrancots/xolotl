@@ -163,19 +163,101 @@ class Pure(unittest.TestCase):
         self.assertEqual(all_skipped["pass_rate"], 0.0)  # no division by zero
         self.assertEqual(run.summarize([])["pass_rate"], 0.0)
 
-        result = {"run_id": "20261004-1530-82ad7b2", "started": "2026-10-04T15:30:12",
-                  "policy_hash": "abcdef1234567890", "note": "v1 baseline", "summary": s}
+        result = {"run_id": "20261004-1530-82ad7b2", "started": "2026-10-04T15:30:12", "dirty": False,
+                  "policy_hash": "abcdef1234567890", "tasks_hash": "0123456789ab", "note": "v1 baseline", "summary": s}
         row = run.history_row(result)
-        self.assertEqual(row, "| 2026-10-04 15:30 | 20261004-1530-82ad7b2 | abcdef12 | 2/3 (66.7%) | 300 / 50 | 12.0s | v1 baseline |")
+        self.assertEqual(row, "| 2026-10-04 15:30 | 20261004-1530-82ad7b2 | abcdef12 | 0123456789ab | 2/3 (66.7%) "
+                              "| 300 / 50 | 12.0s | v1 baseline |")
 
         head, sep = run.HISTORY_HEADER.splitlines()
         self.assertEqual(head.count("|"), row.count("|"))
         self.assertEqual(sep.count("|"), row.count("|"))
         self.assertTrue(run.HISTORY_HEADER.endswith("\n"))
+        self.assertTrue(head.startswith("| Date | Run | Policy | Tasks | Pass |"))
 
         piped = run.history_row({**result, "note": "a|b\nc"})  # a note must not break the table
         self.assertTrue(piped.endswith("| a\\|b c |"))
         self.assertNotIn("\n", piped)
+
+        dirty = run.history_row({**result, "dirty": True})  # a run from a modified tree says so
+        self.assertIn("| 20261004-1530-82ad7b2 (dirty) |", dirty)
+        self.assertEqual(dirty.count("|"), row.count("|"))
+
+    def test_summarize_excludes_infra_errors(self):
+        def att(task, status):
+            return {"task": task, "attempt": 1, "status": status, "pass": status == "pass", "wall_s": 10.0,
+                    "tokens": {"prompt": 5, "completion": 1, "cached": 0}}
+
+        attempts = [att("t1", "pass"), att("t1", "pass"), att("t1", "infra_error"), att("t2", "fail"),
+                    att("t3", "infra_error"), {"task": "t4", "attempt": 1, "status": "skipped", "pass": False}]
+        s = run.summarize(attempts)
+        self.assertEqual((s["pass"], s["total"], s["skipped"], s["infra_errors"]), (2, 6, 1, 2))
+        self.assertEqual(s["pass_rate"], 0.667)  # 2 of the 3 attempts that really ran
+        self.assertEqual(s["per_task"], {"t1": "2/2 (+1 infra)", "t2": "0/1", "t3": "0/0 (+1 infra)", "t4": "skipped"})
+        self.assertEqual(s["tokens"]["prompt"], 25)  # an infra attempt may still have cost tokens
+        self.assertEqual((s["median_wall_s"], s["total_wall_s"]), (10.0, 30.0))  # but its wall time says nothing
+
+        row = run.history_row({"run_id": "r", "started": "2026-10-04T15:30:12", "tasks_hash": "x", "summary": s})
+        self.assertIn("| 2/3 (66.7%) ⚠2 infra |", row)  # the denominator excludes skipped and infra attempts
+        clean = run.summarize([att("t1", "pass")])
+        self.assertEqual(clean["infra_errors"], 0)
+        self.assertNotIn("infra", run.history_row({"run_id": "r", "started": "2026-10-04T15:30:12", "summary": clean}))
+        self.assertEqual(run.summarize([att("t", "infra_error")])["pass_rate"], 0.0)  # no division by zero
+
+
+class Fingerprint(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="bench-fp-"))
+        self.addCleanup(lambda: run._rm(self.tmp))
+        self.dir = self.tmp / "fx-ok"
+        shutil.copytree(TASKS / "fx-ok", self.dir)
+        self.base = run.task_hash(self.dir)
+
+    def copy(self, name: str) -> Path:
+        dst = self.tmp / name / "fx-ok"
+        shutil.copytree(self.dir, dst)
+        return dst
+
+    def test_task_hash_is_short_stable_and_location_independent(self):
+        self.assertRegex(self.base, r"^[0-9a-f]{12}$")
+        self.assertEqual(run.task_hash(self.copy("elsewhere")), self.base)
+
+    def test_task_hash_ignores_line_endings(self):
+        for newline in (b"\n", b"\r\n"):
+            copy = self.copy(f"eol{len(newline)}")
+            for f in copy.rglob("*"):
+                if f.is_file():
+                    f.write_bytes(f.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", newline))
+            self.assertEqual(run.task_hash(copy), self.base)  # autocrlf can't change the fingerprint
+
+    def test_task_hash_changes_with_what_the_agent_or_the_checks_see(self):
+        for rel in ("verify/check.py", "repo/README.txt", "task.json"):
+            with self.subTest(changed=rel):
+                copy = self.copy("edit-" + rel.replace("/", "-"))
+                with open(copy / rel, "a", encoding="utf-8") as f:
+                    f.write("\n# changed\n")
+                self.assertNotEqual(run.task_hash(copy), self.base)
+        added = self.copy("added")
+        (added / "verify" / "extra.py").write_text("x = 1\n")
+        self.assertNotEqual(run.task_hash(added), self.base)
+        renamed = self.copy("renamed")  # same bytes under another path
+        (renamed / "repo" / "README.txt").rename(renamed / "repo" / "README2.txt")
+        self.assertNotEqual(run.task_hash(renamed), self.base)
+
+    def test_task_hash_ignores_solution_and_pycache(self):
+        (self.dir / "solution" / "answer.txt").write_text("43")
+        (self.dir / "solution" / "new.py").write_text("x = 1\n")
+        (self.dir / "verify" / "__pycache__").mkdir()
+        (self.dir / "verify" / "__pycache__" / "check.cpython-314.pyc").write_bytes(b"\x00\x01")
+        self.assertEqual(run.task_hash(self.dir), self.base)
+
+    def test_suite_hash_is_order_independent_and_sensitive(self):
+        h = run.suite_hash({"a": "1" * 12, "b": "2" * 12})
+        self.assertRegex(h, r"^[0-9a-f]{12}$")
+        self.assertEqual(run.suite_hash({"b": "2" * 12, "a": "1" * 12}), h)
+        self.assertNotEqual(run.suite_hash({"a": "1" * 12, "b": "3" * 12}), h)
+        self.assertNotEqual(run.suite_hash({"a": "1" * 12}), h)
+        self.assertNotEqual(run.suite_hash({"a": "2" * 12, "b": "1" * 12}), h)  # the id is part of the line
 
 
 def pid_alive(pid: int) -> bool:
@@ -241,8 +323,18 @@ class Orchestration(unittest.TestCase):
     def quiet_main(self, *argv: str) -> tuple[int, str]:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = run.main(list(argv))
+            code = run.main(["--home", str(self.home), *argv])  # a temp home: never read the real ~/.xolotl
         return code, out.getvalue()
+
+    def make_tasks(self, prompts: dict[str, str]) -> Path:
+        """A tasks dir holding a copy of fx-ok per entry, each with its own id and fake-xolotl prompt."""
+        root = self.tmp / "tasks"
+        root.mkdir()
+        for name, prompt in prompts.items():
+            shutil.copytree(TASKS / "fx-ok", root / name)
+            task_json = root / name / "task.json"
+            task_json.write_text(json.dumps({**json.loads(task_json.read_text()), "id": name, "prompt": prompt}))
+        return root
 
     def test_pass_path(self):
         made = []
@@ -265,6 +357,8 @@ class Orchestration(unittest.TestCase):
         self.assertFalse(os.path.exists(made[0]))  # ... including git's read-only objects
         self.assertIsNone(res["session_dir"])  # the fake writes no session
         self.assertIn("fake: ok", res["stderr_tail"])  # Xolotl's stderr is kept, not just drained
+        self.assertEqual(res["task_hash"], run.task_hash(TASKS / "fx-ok"))
+        self.assertEqual(res["infra_reason"], "")
 
     def test_keep_flag_and_git_setup(self):
         res = self.attempt("ok", keep=True)
@@ -307,6 +401,26 @@ class Orchestration(unittest.TestCase):
         self.assertFalse(res["timed_out"])
         self.assertLessEqual(len(res["stderr_tail"].encode()), 1024)  # 5 KB on stderr, last 1 KB kept
         self.assertTrue(res["stderr_tail"].rstrip().endswith("END"))
+
+    def test_no_session_start_is_infra_error(self):
+        res = self.attempt("crash")  # exits 1 without a single event, like Xolotl with no API key
+        self.assertEqual((res["status"], res["pass"], res["exit_code"]), ("infra_error", False, 1))
+        self.assertIn("session_start", res["infra_reason"])
+        self.assertIn("ZAI_API_KEY", res["stderr_tail"])
+        self.assertTrue(Path(res["kept_dir"]).is_dir())  # kept for inspection, like a failure
+
+    def test_llm_error_is_infra_error(self):
+        res = self.attempt("llmerror")  # quota exhausted: nothing the agent could have done
+        self.assertEqual((res["status"], res["pass"], res["errors"]), ("infra_error", False, 1))
+        self.assertIn("quota", res["infra_reason"])
+
+    def test_agent_side_llm_errors_are_not_infra_errors(self):
+        res = self.attempt("llmretry")  # a context overflow the agent compacted away and retried
+        self.assertEqual((res["status"], res["infra_reason"]), ("pass", ""))
+        res = self.attempt("llmoverflow")  # still too long after compaction: the agent's own failure
+        self.assertEqual((res["status"], res["infra_reason"]), ("fail", ""))
+        res = self.attempt("llmlate")  # a measured pass stays a pass even if the API failed afterwards
+        self.assertEqual((res["status"], res["errors"], res["infra_reason"]), ("pass", 1, ""))
 
     def test_missing_toolchain_skips(self):
         boom = AssertionError("must not start any subprocess or temp dir")
@@ -369,7 +483,7 @@ class Orchestration(unittest.TestCase):
         results = self.tmp / "results"
         results.mkdir()
         history = results / "HISTORY.md"
-        history.write_text(run.HISTORY_HEADER + "| 2026-01-01 00:00 | old | abc | 1/1 (100.0%) | 1 / 1 | 1.0s | old |\n")
+        history.write_text(run.HISTORY_HEADER + "| 2026-01-01 00:00 | old | abc | def | 1/1 (100.0%) | 1 / 1 | 1.0s | old |\n")
         before = history.read_text().splitlines()
         with mock.patch.dict(os.environ, {"ZAI_API_KEY": "sentinel-secret-123"}):
             code, out = self.quiet_main("--tasks-dir", str(TASKS), "--xolotl", str(FAKE), "--note", "t",
@@ -393,11 +507,20 @@ class Orchestration(unittest.TestCase):
         self.assertEqual((att["task"], att["attempt"], att["status"], att["model_calls"]), ("fx-ok", 1, "pass", 1))
         self.assertRegex(out, r"fx-ok.*pass")  # one progress line per attempt
 
+        fx_hash = run.task_hash(TASKS / "fx-ok")  # the suite fingerprint, per attempt and per run
+        self.assertEqual(att["task_hash"], fx_hash)
+        self.assertEqual(res["tasks_hash"], run.suite_hash({"fx-ok": fx_hash}))
+        self.assertEqual((res["xolotl_source"], res["xolotl_config"]), (str(FAKE), None))  # no config.json in the temp home
+        self.assertEqual(res["summary"]["infra_errors"], 0)
+
         after = history.read_text().splitlines()
         self.assertEqual(after[:len(before)], before)
         self.assertEqual(len(after), len(before) + 1)  # exactly one new row
         self.assertTrue(after[-1].endswith("| t |"), after[-1])
         self.assertIn(res["run_id"], after[-1])
+        self.assertIn(f"| {res['tasks_hash']} |", after[-1])
+        self.assertEqual(" (dirty) |" in after[-1], res["dirty"])  # the row marks a run from a modified tree
+        self.assertEqual(after[-1].count("|"), run.HISTORY_HEADER.splitlines()[0].count("|"))
 
         # a missing HISTORY.md gets the header first
         fresh = self.tmp / "fresh"
@@ -408,6 +531,52 @@ class Orchestration(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         (path,) = fresh.glob("*.json")
         self.assertEqual(json.loads(path.read_text())["summary"]["total"], 2)
+
+    def test_main_records_xolotl_config(self):
+        (self.home / ".xolotl").mkdir()
+        config = self.home / ".xolotl" / "config.json"
+        config.write_bytes(b'\xef\xbb\xbf{"model": "m1", "mode": "yolo", "api_key_env": "BENCH_TEST_KEY"}')  # BOM, as PowerShell writes
+        argv = ["--tasks-dir", str(TASKS), "--xolotl", str(FAKE)]
+        with mock.patch.dict(os.environ, {"BENCH_TEST_KEY": "sentinel-secret-456"}):  # only the variable's name is in the config
+            code, out = self.quiet_main(*argv, "--results-dir", str(self.tmp / "r1"))
+        self.assertEqual(code, 0)
+        (path,) = (self.tmp / "r1").glob("*.json")
+        self.assertEqual(json.loads(path.read_text())["xolotl_config"],
+                         {"model": "m1", "mode": "yolo", "api_key_env": "BENCH_TEST_KEY"})
+        self.assertNotIn("sentinel-secret-456", path.read_text() + out)  # environment values are never read
+
+        config.write_text("{not json")  # a broken config is recorded as absent, not a crash
+        self.assertEqual(self.quiet_main(*argv, "--results-dir", str(self.tmp / "r2"))[0], 0)
+        (path,) = (self.tmp / "r2").glob("*.json")
+        self.assertIsNone(json.loads(path.read_text())["xolotl_config"])
+
+    def test_main_infra_errors_are_excluded_and_flagged(self):
+        tasks = self.make_tasks({"fx-1": "ok", "fx-2": "crash"})
+        results = self.tmp / "results"
+        code, out = self.quiet_main("--tasks-dir", str(tasks), "--xolotl", str(FAKE), "--results-dir", str(results))
+        self.assertEqual(code, 0)  # the run completed; the warning is in the output and the row
+        (path,) = results.glob("*.json")
+        res = json.loads(path.read_text())
+        self.assertEqual([a["status"] for a in res["attempts"]], ["pass", "infra_error"])
+        s = res["summary"]
+        self.assertEqual((s["pass"], s["total"], s["infra_errors"], s["pass_rate"]), (1, 2, 1, 1.0))
+        self.assertEqual(s["per_task"], {"fx-1": "1/1", "fx-2": "0/0 (+1 infra)"})
+        self.assertRegex(out, r"fx-2 #1: infra_error")
+        self.assertRegex(out, r"(?i)warning.*1.*infra")
+        row = (results / "HISTORY.md").read_text(encoding="utf-8").splitlines()[-1]  # the file is UTF-8
+        self.assertIn("| 1/1 (100.0%) ⚠1 infra |", row)
+
+    def test_main_fingerprint(self):
+        boom = AssertionError("--fingerprint must not build, run Xolotl or write results")
+        results = self.tmp / "results"
+        with mock.patch.object(run.subprocess, "Popen", side_effect=boom), \
+                mock.patch.object(run.subprocess, "run", side_effect=boom):
+            code, out = self.quiet_main("--fingerprint", "--tasks-dir", str(TASKS), "--results-dir", str(results))
+        self.assertEqual(code, 0)
+        h = run.task_hash(TASKS / "fx-ok")
+        self.assertRegex(out, rf"fx-ok\s+{h}")
+        self.assertRegex(out, rf"tasks_hash\s+{run.suite_hash({'fx-ok': h})}")
+        self.assertFalse(results.exists())
 
     def test_main_ctrl_c_writes_partial_results(self):
         results = self.tmp / "results"
@@ -447,12 +616,7 @@ class Orchestration(unittest.TestCase):
         self.assertEqual([r.split("|")[2].strip() for r in rows], [base, f"{base}-2", f"{base}-3"])
 
     def test_exception_in_an_attempt_keeps_earlier_attempts(self):
-        tasks = self.tmp / "tasks"
-        tasks.mkdir()
-        for name in ("fx-1", "fx-2"):
-            shutil.copytree(TASKS / "fx-ok", tasks / name)
-            task_json = tasks / name / "task.json"
-            task_json.write_text(json.dumps({**json.loads(task_json.read_text()), "id": name}))
+        tasks = self.make_tasks({"fx-1": "ok", "fx-2": "ok"})
         shutil.rmtree(tasks / "fx-2" / "repo")  # the second task's repo copy raises FileNotFoundError
         results = self.tmp / "results"
         err = io.StringIO()

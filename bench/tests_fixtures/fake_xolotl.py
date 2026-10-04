@@ -1,9 +1,15 @@
-"""Stand-in for the xolotl binary, used by bench/test_run.py. The -p prompt picks the behaviour:
+"""Stand-in for the xolotl binary, used by bench/test_run.py. Like the real one it starts every session with a
+session_start event (except `crash`). The -p prompt picks the rest of the behaviour:
 
-ok      write answer.txt = 42, a line on stderr, and emit a short event stream
-plant   plant a verify/test_planted.py that always passes, nothing else
-hang    spawn a long-sleeping child, record its pid in child.pid, then sleep too
-garbage print 1 MB of non-JSON bytes, 5 KB on stderr, then one assistant event
+ok           write answer.txt = 42, a line on stderr, and emit a short event stream
+plant        plant a verify/test_planted.py that always passes, nothing else
+hang         spawn a long-sleeping child, record its pid in child.pid, then sleep too
+garbage      print 1 MB of non-JSON bytes, 5 KB on stderr, then one assistant event
+crash        no events at all, a message on stderr, exit 1 (e.g. the API key variable is not set)
+llmerror     a terminal LLM error (quota), exit 1, nothing solved
+llmlate      solve it (answer.txt = 42), then a terminal LLM error
+llmretry     an LLM error marked retry=true (context overflow, then compacted), then solve it
+llmoverflow  a terminal context-overflow error, nothing solved (the agent's own failure, not the API's)
 """
 import json
 import subprocess
@@ -28,10 +34,13 @@ def main(argv: list[str]) -> int:
         return 0
     cwd = Path(argv[argv.index("--cwd") + 1])
     prompt = argv[argv.index("-p") + 1]
+    if prompt == "crash":
+        print("fake: set ZAI_API_KEY to your API key", file=sys.stderr)
+        return 1
+    emit("session_start", cwd=str(cwd), model="fake-model", mode="yolo", policy_hash="fakehash", system="")
     if prompt == "ok":
         (cwd / "answer.txt").write_text("42", encoding="utf-8")
         print("fake: ok", file=sys.stderr)
-        emit("session_start", cwd=str(cwd), model="fake-model", mode="yolo", policy_hash="fakehash", system="")
         assistant()
         emit("session_end", status="ok")
     elif prompt == "plant":
@@ -47,6 +56,21 @@ def main(argv: list[str]) -> int:
         sys.stdout.buffer.flush()
         print("x" * 5000 + "END", file=sys.stderr)  # more than the 1 KB the runner keeps
         assistant()
+    elif prompt == "llmerror":
+        emit("error", kind="llm", message="quota or balance exhausted: fake", retry=False)
+        return 1
+    elif prompt == "llmlate":
+        (cwd / "answer.txt").write_text("42", encoding="utf-8")
+        assistant()
+        emit("error", kind="llm", message="network error: fake", retry=False)
+        return 1
+    elif prompt == "llmretry":
+        emit("error", kind="llm", message="context window exceeded: fake", retry=True)
+        (cwd / "answer.txt").write_text("42", encoding="utf-8")
+        assistant()
+    elif prompt == "llmoverflow":
+        emit("error", kind="llm", message="context window exceeded: fake", retry=False)
+        return 1
     return 0
 
 

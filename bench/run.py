@@ -3,6 +3,7 @@
 Standard library only. The pure helpers come first; orchestration (run_attempt, selfcheck, main) lives below them.
 """
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -26,8 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Header + separator of results/HISTORY.md. Ends with a newline so a row can be appended straight after it.
 HISTORY_HEADER = (
-    "| Date | Run | Policy | Pass | Tokens (prompt / completion) | Median wall | Note |\n"
-    "|---|---|---|---|---|---|---|\n"
+    "| Date | Run | Policy | Tasks | Pass | Tokens (prompt / completion) | Median wall | Note |\n"
+    "|---|---|---|---|---|---|---|---|\n"
 )
 
 
@@ -125,22 +126,27 @@ def session_dir(home: Path, cwd: str) -> Path | None:
 
 
 def summarize(attempts: list[dict]) -> dict:
-    """Run summary. Skipped attempts count in `total` but not in `pass_rate` or `per_task` denominators."""
-    ran = [a for a in attempts if a.get("status") != "skipped"]
+    """Run summary. Skipped and infra_error attempts (no session ran, or the model API failed) count in `total` but
+    not in the `pass_rate`, `per_task` or wall-time figures; tokens are summed over every attempt."""
+    ran = [a for a in attempts if a.get("status") not in ("skipped", "infra_error")]
+    infra = sum(1 for a in attempts if a.get("status") == "infra_error")
     passed = sum(1 for a in ran if a.get("pass"))
-    per: dict[str, list[int]] = {}  # task -> [passes, attempts that ran]
+    per: dict[str, list[int]] = {}  # task -> [passes, attempts that ran, infra errors]
     for a in attempts:
-        counts = per.setdefault(a["task"], [0, 0])
-        if a.get("status") != "skipped":
+        counts = per.setdefault(a["task"], [0, 0, 0])
+        if a.get("status") == "infra_error":
+            counts[2] += 1
+        elif a.get("status") != "skipped":
             counts[0] += bool(a.get("pass"))
             counts[1] += 1
     walls = [a["wall_s"] for a in ran if isinstance(a.get("wall_s"), (int, float))]
     return {
         "pass": passed,
         "total": len(attempts),
-        "skipped": len(attempts) - len(ran),
+        "skipped": len(attempts) - len(ran) - infra,
+        "infra_errors": infra,
         "pass_rate": round(passed / len(ran), 3) if ran else 0.0,
-        "per_task": {t: f"{p}/{n}" if n else "skipped" for t, (p, n) in per.items()},
+        "per_task": {t: f"{p}/{n}" + (f" (+{i} infra)" if i else "") if n or i else "skipped" for t, (p, n, i) in per.items()},
         "tokens": {k: sum(_count(a.get("tokens"), k) for a in attempts) for k in ("prompt", "completion", "cached")},
         "median_wall_s": round(statistics.median(walls), 3) if walls else 0.0,
         "total_wall_s": round(sum(walls), 3),
@@ -150,17 +156,39 @@ def summarize(attempts: list[dict]) -> dict:
 def history_row(result: dict) -> str:
     """One HISTORY.md table row (no trailing newline) for a results/<run_id>.json dict."""
     s = result["summary"]
-    ran = s["total"] - s["skipped"]
+    infra = s.get("infra_errors", 0)
+    ran = s["total"] - s["skipped"] - infra
     cells = [
         datetime.fromisoformat(result["started"]).strftime("%Y-%m-%d %H:%M"),
-        result["run_id"],
+        result["run_id"] + (" (dirty)" if result.get("dirty") else ""),  # built from a modified source tree
         (result.get("policy_hash") or "")[:8],
-        f"{s['pass']}/{ran} ({s['pass_rate'] * 100:.1f}%)",
+        result.get("tasks_hash") or "",
+        f"{s['pass']}/{ran} ({s['pass_rate'] * 100:.1f}%)" + (f" ⚠{infra} infra" if infra else ""),
         f"{s['tokens']['prompt']} / {s['tokens']['completion']}",
         f"{s['median_wall_s']:.1f}s",
         (result.get("note") or "").replace("|", "\\|").replace("\n", " "),  # a note must not break the table
     ]
     return "| " + " | ".join(cells) + " |"
+
+
+def task_hash(task_dir: Path) -> str:
+    """Fingerprint (12 hex) of what a task shows the agent and what decides it: task.json, repo/ and verify/, each
+    file by relative path and content. solution/ and __pycache__ are left out; CRLF reads as LF so a Windows
+    checkout (autocrlf) can't change it."""
+    files = [task_dir / "task.json"]
+    for d in ("repo", "verify"):
+        if (task_dir / d).is_dir():
+            files += [p for p in (task_dir / d).rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+    h = hashlib.sha256()
+    for rel, p in sorted((p.relative_to(task_dir).as_posix(), p) for p in files):
+        data = p.read_bytes().replace(b"\r\n", b"\n")
+        h.update(f"{rel}\0{len(data)}\0".encode() + data)  # the length keeps one file's end from sliding into the next
+    return h.hexdigest()[:12]
+
+
+def suite_hash(hashes: dict[str, str]) -> str:
+    """Fingerprint (12 hex) of a set of tasks, from their ids and task_hash values."""
+    return hashlib.sha256("\n".join(f"{t}:{h}" for t, h in sorted(hashes.items())).encode()).hexdigest()[:12]
 
 
 # ---- orchestration ---------------------------------------------------------------------------------------------
@@ -281,16 +309,32 @@ def _init_repo(path: str) -> None:
         subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, stdin=subprocess.DEVNULL)
 
 
+def _infra_reason(events: list[dict]) -> str:
+    """Why an attempt says nothing about the agent, or "": no session ever started (e.g. the API key variable is
+    unset), or the model API failed for good (quota, auth, network, HTTP). Not infra: an `llm` error marked retry,
+    which is a context overflow the agent compacted away and retried, and a repeated overflow, which is the agent's
+    own context management failing (messages as in llm.rs `LlmError`'s Display)."""
+    if not any(e.get("type") == "session_start" for e in events):
+        return "no session_start event"
+    for e in events:
+        if e.get("type") == "error" and e.get("kind") == "llm" and e.get("retry") is not True:
+            msg = str(e.get("message", ""))
+            if not msg.startswith("context window exceeded"):
+                return f"llm error: {msg[:200]}"
+    return ""
+
+
 def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
                 budget: int | None, keep: bool, attempt: int = 1) -> dict:
     """One attempt: fresh git-initialised copy of repo/, run Xolotl on it, replace verify/ with the real one, verify,
-    collect metrics. The temp dir is deleted only if the attempt passed and `keep` is off."""
+    collect metrics. The temp dir is deleted only if the attempt passed and `keep` is off. Status: `pass`, `fail`,
+    `skipped` (a toolchain is missing) or `infra_error` (see _infra_reason; only for an attempt that didn't pass)."""
     missing = [r for r in task["requires"] if shutil.which(r) is None]
-    base = {"task": task["id"], "attempt": attempt}
+    base = {"task": task["id"], "attempt": attempt, "task_hash": task_hash(task_dir)}
     if missing:
         return {**base, "status": "skipped", "pass": False, "exit_code": None, "timed_out": False, "wall_s": 0.0,
-                "verify_output": f"missing toolchain: {', '.join(missing)}", "stderr_tail": "", "kept_dir": None,
-                "session_dir": None, "model": "", **metrics_from_events([])}
+                "verify_output": f"missing toolchain: {', '.join(missing)}", "stderr_tail": "", "infra_reason": "",
+                "kept_dir": None, "session_dir": None, "model": "", **metrics_from_events([])}
 
     tmp = tempfile.mkdtemp(prefix="xolotl-bench-")  # the same string goes to --cwd and session_dir (slug parity)
     try:
@@ -310,7 +354,9 @@ def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
         except OSError:
             pass
         lines = stdout.decode("utf-8", errors="replace").split("\n")  # not splitlines(): U+2028 may sit inside a JSON string
-        model = next((e["model"] for e in _events(lines) if e.get("type") == "session_start" and isinstance(e.get("model"), str)), "")
+        events = list(_events(lines))
+        model = next((e["model"] for e in events if e.get("type") == "session_start" and isinstance(e.get("model"), str)), "")
+        infra = "" if ok else _infra_reason(events)  # a measured pass stays a pass
         sd = session_dir(home, tmp)
         kept = tmp
         if ok and not keep:
@@ -325,8 +371,9 @@ def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
         except OSError:  # e.g. a dying child still holds the dir; that must not replace the exception being handled
             pass
         raise
-    return {**base, "status": "pass" if ok else "fail", "pass": ok, "exit_code": exit_code, "timed_out": timed_out,
-            "wall_s": wall_s, "verify_output": verify_output, "stderr_tail": stderr[-1024:].decode("utf-8", errors="replace"),
+    return {**base, "status": "pass" if ok else "infra_error" if infra else "fail", "pass": ok, "exit_code": exit_code,
+            "timed_out": timed_out, "wall_s": wall_s, "verify_output": verify_output,
+            "stderr_tail": stderr[-1024:].decode("utf-8", errors="replace"), "infra_reason": infra,
             "kept_dir": kept, "session_dir": str(sd) if sd else None, "model": model, **metrics_from_events(lines)}
 
 
@@ -371,8 +418,10 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--note", default="", help="free text recorded in the results and HISTORY.md")
     p.add_argument("--keep", action="store_true", help="keep every attempt's temp dir, not only failed ones")
     p.add_argument("--selfcheck", action="store_true", help="check each task is solvable and not already solved (no model calls)")
+    p.add_argument("--fingerprint", action="store_true", help="print each selected task's hash and the suite hash, then exit")
     p.add_argument("--tasks-dir", type=Path, default=here / "tasks", help="default: bench/tasks")
     p.add_argument("--results-dir", type=Path, default=here / "results", help=argparse.SUPPRESS)
+    p.add_argument("--home", type=Path, help=argparse.SUPPRESS)  # where ~/.xolotl is; tests point it at a temp dir
     return p
 
 
@@ -383,6 +432,16 @@ def _git(*args: str) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout.decode("utf-8", errors="replace").strip() if r.returncode == 0 else ""
+
+
+def _xolotl_config(home: Path) -> dict | None:
+    """The parsed <home>/.xolotl/config.json, or None if it is absent or unreadable. It can't hold a secret: Xolotl
+    rejects unknown fields and takes the API key from an environment variable, which the runner never reads."""
+    try:
+        cfg = json.loads((home / ".xolotl" / "config.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return cfg if isinstance(cfg, dict) else None
 
 
 def _dirty() -> bool:
@@ -397,9 +456,13 @@ def _print_summary(result: dict, path: Path) -> None:
     for t, r in s["per_task"].items():
         print(f"{t:<{width}}  {r}")
     t = s["tokens"]
-    print(f"\n{s['pass']}/{s['total'] - s['skipped']} passed ({s['pass_rate'] * 100:.1f}%), {s['skipped']} skipped; "
+    ran = s["total"] - s["skipped"] - s["infra_errors"]
+    print(f"\n{s['pass']}/{ran} passed ({s['pass_rate'] * 100:.1f}%), {s['skipped']} skipped; "
           f"tokens {t['prompt']} prompt / {t['completion']} completion ({t['cached']} cached); "
           f"median {s['median_wall_s']:.1f}s, total {s['total_wall_s']:.1f}s")
+    if s["infra_errors"]:
+        print(f"WARNING: {s['infra_errors']} attempt(s) hit infra errors (no session started, or the model API failed) "
+              "and are excluded from the pass rate; see infra_reason and stderr_tail in the results")
     print(f"results: {path}")
 
 
@@ -417,6 +480,14 @@ def main(argv: list[str]) -> int:
     if not tasks:
         print(f"error: no tasks in {args.tasks_dir}", file=sys.stderr)
         return 2
+
+    hashes = {task["id"]: task_hash(task_dir) for task, task_dir in tasks}
+    if args.fingerprint:
+        width = max(len(t) for t in [*hashes, "tasks_hash"])
+        for t, h in hashes.items():
+            print(f"{t:<{width}}  {h}")
+        print(f"{'tasks_hash':<{width}}  {suite_hash(hashes)}")
+        return 0
 
     if args.selfcheck:
         failed = 0
@@ -459,6 +530,8 @@ def main(argv: list[str]) -> int:
         started = datetime.now().astimezone()
         sha = _git("rev-parse", "HEAD") or "unknown"
         dirty = _dirty()  # sampled now, with the sha: the attempts must not change what the run is labelled with
+        home = args.home or Path.home()
+        config = _xolotl_config(home)
         run_id = f"{started:%Y%m%d-%H%M}-{sha[:7]}"
         total = len(tasks) * args.repeat
         attempts: list[dict] = []
@@ -467,10 +540,12 @@ def main(argv: list[str]) -> int:
             for task, task_dir in tasks:
                 for i in range(1, args.repeat + 1):
                     where = f"{task['id']} #{i}"
-                    a = run_attempt(task, task_dir, cmd, Path.home(), args.budget, args.keep, i)
+                    a = run_attempt(task, task_dir, cmd, home, args.budget, args.keep, i)
                     attempts.append(a)
-                    note = f" ({a['verify_output']})" if a["status"] == "skipped" else " (timed out)" if a["timed_out"] else ""
-                    print(f"[{len(attempts)}/{total}] {where}: {a['status']:<7} {a['wall_s']:7.1f}s  "
+                    note = (f" ({a['verify_output']})" if a["status"] == "skipped" else
+                            f" ({a['infra_reason']})" if a["status"] == "infra_error" else
+                            " (timed out)" if a["timed_out"] else "")
+                    print(f"[{len(attempts)}/{total}] {where}: {a['status']:<11} {a['wall_s']:7.1f}s  "
                           f"{a['model_calls']} model calls{note}", flush=True)
         except KeyboardInterrupt:
             exit_code = 130
@@ -484,8 +559,10 @@ def main(argv: list[str]) -> int:
         result = {
             "run_id": run_id, "started": started.isoformat(timespec="seconds"), "git_sha": sha, "dirty": dirty,
             "xolotl_version": v.stdout.decode("utf-8", errors="replace").strip(),
+            "xolotl_source": args.xolotl or "built", "xolotl_config": config,
             "model": next((a["model"] for a in attempts if a["model"]), ""),
             "policy_hash": next((a["policy_hash"] for a in attempts if a["policy_hash"]), ""),
+            "tasks_hash": suite_hash(hashes),
             "repeat": args.repeat, "budget": args.budget, "note": args.note, "partial": partial,
             **({"error": error} if error else {}),
             "attempts": attempts, "summary": summarize(attempts),
