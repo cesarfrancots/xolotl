@@ -162,7 +162,7 @@ pub fn build_view(events: &[Event]) -> Vec<Message> {
         _ => None,
     });
     view.extend(render(events, after, stage1.filter(|&u| u > after).unwrap_or(0)));
-    view
+    merge_users(view) // a cut before a user event leaves the summary next to a User: one turn, not two
 }
 
 /// Events with `seq > after_seq` as messages; tool results with `seq <= stub_upto` (except `todo`) become stubs.
@@ -414,8 +414,7 @@ mod tests {
             build_view(&events),
             vec![
                 Message::System("S".into()),
-                Message::User("SUM".into()),
-                Message::User("u2".into()),
+                Message::User("SUM\n\nu2".into()), // cut before a user event: the summary and that user turn merge
                 asst_msg("", None, vec![call("c2", "bash")]),
                 tool("c2", "[elided: 2KB bash output — events.jsonl seq 8]"),
                 asst_msg("", None, vec![call("c3", "bash")]),
@@ -425,6 +424,26 @@ mod tests {
         // a stage-1 cutoff that is not past the cut is ignored (seq 8 stays verbatim)
         let view = build_view(&events[..13]);
         assert!(view.contains(&tool("c2", &"z".repeat(1_500))));
+
+        // mid-turn cut (before an assistant event): the summary stays a separate User
+        let mid = vec![
+            ev(1, session_start("S")),
+            ev(2, user("u1")),
+            ev(3, asst_calls(&[("c1", "bash", "{}")])),
+            ev(4, result("c1", "bash", "old")),
+            ev(5, asst_calls(&[("c2", "bash", "{}")])),
+            ev(6, result("c2", "bash", "new")),
+            ev(7, compaction(2, None, Some(4), Some("SUM"))),
+        ];
+        assert_eq!(
+            build_view(&mid),
+            vec![
+                Message::System("S".into()),
+                Message::User("SUM".into()),
+                asst_msg("", None, vec![call("c2", "bash")]),
+                tool("c2", "new"),
+            ]
+        );
     }
 
     #[test]
@@ -457,6 +476,44 @@ mod tests {
                 asst_msg("", None, vec![call("c1", "read"), call("c2", "read")]),
                 tool("c1", "cancelled (no result recorded)"),
                 tool("c2", "cancelled (no result recorded)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn view_pairing_tricky_orderings() {
+        let r = |events: Vec<Event>| render(&events, 0, 0);
+        // a duplicate result for one call_id: the first is kept, the second dropped
+        assert_eq!(
+            r(vec![
+                ev(1, asst_calls(&[("c1", "read", "{}")])),
+                ev(2, result("c1", "read", "first")),
+                ev(3, result("c1", "read", "dup")),
+            ]),
+            vec![asst_msg("", None, vec![call("c1", "read")]), tool("c1", "first")]
+        );
+        // a result arriving after an intervening nudge no longer answers the call: it is dropped, a synthetic one goes first
+        assert_eq!(
+            r(vec![
+                ev(1, asst_calls(&[("c1", "read", "{}")])),
+                ev(2, Kind::Nudge { reason: "empty".into(), text: "n".into() }),
+                ev(3, result("c1", "read", "late")),
+            ]),
+            vec![asst_msg("", None, vec![call("c1", "read")]), tool("c1", "cancelled (no result recorded)"), Message::User("n".into())]
+        );
+        // two consecutive assistants with calls: the first is closed off, and a late result for it is dropped
+        assert_eq!(
+            r(vec![
+                ev(1, asst_calls(&[("c1", "read", "{}")])),
+                ev(2, asst_calls(&[("c2", "read", "{}")])),
+                ev(3, result("c1", "read", "late")),
+                ev(4, result("c2", "read", "r2")),
+            ]),
+            vec![
+                asst_msg("", None, vec![call("c1", "read")]),
+                tool("c1", "cancelled (no result recorded)"),
+                asst_msg("", None, vec![call("c2", "read")]),
+                tool("c2", "r2"),
             ]
         );
     }
