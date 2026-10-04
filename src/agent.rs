@@ -78,11 +78,13 @@ impl Agent<'_> {
         }
     }
 
-    /// The compaction triggers (spec §10.2–10.4), checked after each batch of tool calls.
-    fn compact_if_needed(&mut self) -> Result<(), Outcome> {
+    /// The compaction triggers (spec §10.2–10.4), checked before every model call. Once a stage 2 fails, `stage2_failed`
+    /// keeps the rest of the request from paying for another summary call at every step (stage 1 may still run).
+    fn compact_if_needed(&mut self, stage2_failed: &mut bool) -> Result<(), Outcome> {
         let tokens = policy::estimate_tokens(&self.session.events);
         match policy::compaction_needed(tokens, self.budget, &self.session.events) {
             None => {}
+            Some(Compaction::Stage2) if *stage2_failed => {}
             Some(Compaction::Stage1 { upto_seq }) => {
                 let kind = Kind::Compaction {
                     stage: 1,
@@ -98,6 +100,7 @@ impl Agent<'_> {
             }
             Some(Compaction::Stage2) => {
                 if let Err(e) = self.stage2(None)? {
+                    *stage2_failed = true;
                     self.ui.notice(&e); // the loop goes on with the view unchanged
                 }
             }
@@ -176,8 +179,14 @@ impl Agent<'_> {
         let schemas = tools::schemas();
         let (mut steps, mut check_fired, mut edited, mut empty_retried, mut overflow_retried) = (0, false, false, false, false);
         let mut recent: Vec<Seen> = Vec::new(); // tool results since the last repeat nudge
+        let mut stage2_failed = false;
         loop {
-            // Ctrl+C during the last tool of a batch (or at its prompt) must not send another model request
+            // Before every model call, a request's first included: tool-free turns grow the context too. Not while a
+            // Ctrl+C is pending: the check below ends the request, and a summary call now would only be cut short.
+            if !self.cancel.load(Ordering::SeqCst) {
+                self.compact_if_needed(&mut stage2_failed)?;
+            }
+            // Ctrl+C during the last tool of a batch (or at its prompt, or during a summary call) must not send another model request
             if self.cancel.load(Ordering::SeqCst) {
                 return self.interrupt(&[], "tool", None);
             }
@@ -262,11 +271,6 @@ impl Agent<'_> {
                 if cancelled {
                     return self.interrupt(&calls[i + 1..], "tool", Some(&call.id));
                 }
-            }
-
-            // after a Ctrl+C the top of the loop ends the request; a summary call now would only be cut short
-            if !self.cancel.load(Ordering::SeqCst) {
-                self.compact_if_needed()?;
             }
 
             let n = LIMITS.repeat_threshold;
@@ -1173,5 +1177,71 @@ mod tests {
         assert_eq!(ui.notices, ["nothing to compact"]);
         assert_eq!(session.events.len(), 1);
         assert!(ui.events.is_empty() && m.requests.is_empty());
+    }
+
+    /// A text reply that reports `prompt` tokens.
+    fn text_at(s: &str, prompt: u64) -> Result<Reply, LlmError> {
+        Ok(Reply { usage: Usage { prompt, ..Usage::default() }, ..text(s).unwrap() })
+    }
+
+    #[test]
+    fn text_only_requests_compact_before_the_next_call() {
+        // budget 1_000; no tool calls anywhere. The second answer reports 900 tokens (≥ 85%), so the third request
+        // compacts before its first model call.
+        let mut m = Scripted::new(vec![text_at("a1", 100), text_at("a2", 900), text("SUM"), text("a3")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("textonly", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        a.budget = 1_000;
+        for request in ["first", "second", "third"] {
+            assert_eq!(a.run_request(request), Outcome::Done, "{request}");
+        }
+        let session = a.session;
+
+        assert_eq!(m.requests.len(), 4);
+        assert_eq!(m.requests.iter().map(|r| r.1).collect::<Vec<_>>(), [tools::schemas().len(), tools::schemas().len(), 0, tools::schemas().len()]);
+        assert_eq!(stages(&session.events), [2]);
+        // the third request's call is sent from the summary of the first turn (cut A keeps the last two user turns)
+        let third = &m.requests[3].0;
+        assert!(
+            matches!(&third[..], [Message::System(_), Message::User(u), Message::Assistant { text, .. }, Message::User(last)]
+                if u.starts_with("[Session summary — events 1–3") && u.ends_with("\n\nsecond") && text == "a2" && last == "third"),
+            "{third:?}"
+        );
+    }
+
+    #[test]
+    fn failed_stage2_is_not_retried_in_the_same_request() {
+        // budget 3_000; every reply of the first request reports ≥ 85%. The first summary call fails; the rest of that request
+        // makes no further summary call. The next request may try again (its first call is checked too), and succeeds.
+        let mut m = Scripted::new(vec![
+            read_f(1, 2_600),
+            Err(LlmError::Network("reset".into())),
+            read_f(2, 2_700),
+            read_f(3, 2_800),
+            text_at("done", 2_900),
+            text("SUM"),
+            text("ok"),
+        ]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("latch", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        a.budget = 3_000;
+        write_files(&a.tools.root, 3, "x");
+        assert_eq!(a.run_request("go"), Outcome::Done);
+        let Agent { session, perms, tools, .. } = a;
+
+        let summary_calls = |m: &Scripted| m.requests.iter().filter(|r| r.1 == 0).count();
+        assert_eq!(m.requests.len(), 5); // read, failed summary, read, read, answer
+        assert_eq!(summary_calls(&m), 1);
+        assert_eq!(errors(&session.events, "compaction").len(), 1);
+        assert_eq!(ui.notices, ["compaction failed: network error: reset"]);
+        assert!(stages(&session.events).is_empty());
+
+        // the latch is per request
+        let mut a = Agent { session, model: &mut m, ui: &mut ui, perms, tools, budget: 3_000, cancel: &cancel };
+        assert_eq!(a.run_request("again"), Outcome::Done);
+        let session = a.session;
+        assert_eq!(m.requests.len(), 7);
+        assert_eq!(summary_calls(&m), 2);
+        assert_eq!(stages(&session.events), [2]);
     }
 }
