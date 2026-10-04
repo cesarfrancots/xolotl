@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -107,54 +108,116 @@ pub struct ZaiConfig {
     pub temperature: f64, pub top_p: f64, pub reasoning_effort: Option<String>,
 }
 
-pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent }
+/// No message from the worker for this long means the server went silent.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often `attempt` wakes to check `cancel` while waiting for the worker.
+const POLL: Duration = Duration::from_millis(100);
+
+pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent, idle: Duration }
+
+/// What the worker thread reports back to `attempt`.
+enum Msg {
+    Open(u16),                       // 2xx headers received
+    Line(String),                    // one raw line of the body
+    Eof,                             // body ended
+    Failed(LlmError, Option<u64>),   // transport error or non-2xx, plus parsed Retry-After seconds
+}
 
 impl ZaiClient {
     pub fn new(cfg: ZaiConfig) -> Self {
-        // No global/body timeout: a stream may legitimately run for minutes.
+        // No global/body timeout: a stream may legitimately run for minutes; `attempt` enforces the idle limit.
         let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder()
             .http_status_as_error(false).timeout_connect(Some(Duration::from_secs(30))).build());
-        ZaiClient { cfg, agent }
+        ZaiClient { cfg, agent, idle: IDLE_TIMEOUT }
+    }
+
+    /// Starts the request on a worker thread. A blocking read cannot be interrupted, so the worker simply
+    /// outlives a cancelled attempt: it exits when its send fails (receiver dropped) or the socket closes.
+    fn open(&self, body: &str) -> mpsc::Receiver<Msg> {
+        let (tx, rx) = mpsc::channel();
+        let agent = self.agent.clone();
+        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
+        let auth = format!("Bearer {}", self.cfg.api_key);
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Err((e, retry_after)) = read_stream(&agent, &url, &auth, &body, &tx) {
+                let _ = tx.send(Msg::Failed(e, retry_after));
+            }
+        });
+        rx
     }
 
     /// One HTTP attempt. On error, also returns the parsed `Retry-After` seconds.
     fn attempt(&self, body: &str, state: &mut StreamState, on: &mut dyn FnMut(Delta),
                cancel: &AtomicBool) -> Result<Reply, (LlmError, Option<u64>)> {
-        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
-        let mut resp = self.agent.post(&url)
-            .header("Authorization", format!("Bearer {}", self.cfg.api_key))
-            .header("Accept-Encoding", "identity") // compression would buffer deltas
-            .content_type("application/json")
-            .send(body)
-            .map_err(|e| (LlmError::Network(e.to_string()), None))?;
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let retry_after = resp.headers().get("retry-after")
-                .and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
-            let text = resp.body_mut().read_to_string().unwrap_or_default();
-            return Err((classify(status, &text), retry_after));
-        }
-        let mut reader = BufReader::new(resp.body_mut().as_reader());
-        let mut line = String::new();
+        let rx = self.open(body);
+        let (mut status, mut done, mut last) = (0, false, Instant::now());
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => return Err((LlmError::Network(e.to_string()), None)),
+            if cancel.load(Ordering::Relaxed) {
+                state.reply.interrupted = true;
+                return Ok(finish(std::mem::take(state)));
             }
-            if let Some(e) = stream_error(status, &line) { return Err((e, None)); }
-            match sse_data(&line) {
-                Some("[DONE]") => break,
-                // ponytail: unparseable data lines are skipped; a mid-stream error object is not surfaced until the probe shows its shape.
-                Some(data) => if let Ok(chunk) = serde_json::from_str::<Value>(data) { apply_chunk(state, &chunk, on) },
-                None => {}
+            let msg = match rx.recv_timeout(POLL) {
+                Ok(m) => m,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if last.elapsed() >= self.idle { return Err((LlmError::Network("stream stalled".into()), None)); }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Msg::Eof,
+            };
+            last = Instant::now();
+            match msg {
+                Msg::Open(s) => status = s,
+                Msg::Failed(e, retry_after) => return Err((e, retry_after)),
+                Msg::Eof => break,
+                Msg::Line(line) => {
+                    if let Some(e) = stream_error(status, &line) { return Err((e, None)); }
+                    match sse_data(&line) {
+                        Some("[DONE]") => { done = true; break; }
+                        // ponytail: unparseable data lines are skipped.
+                        Some(data) => if let Ok(chunk) = serde_json::from_str::<Value>(data) { apply_chunk(state, &chunk, on) },
+                        None => {}
+                    }
+                }
             }
-            if cancel.load(Ordering::Relaxed) { state.reply.interrupted = true; break; }
+        }
+        if !stream_complete(done, &state.reply.finish_reason) {
+            return Err((LlmError::Network("stream ended before [DONE]".into()), None));
         }
         Ok(finish(std::mem::take(state)))
     }
 }
+
+/// Worker body: send the request, classify non-2xx, then forward the body line by line.
+fn read_stream(agent: &ureq::Agent, url: &str, auth: &str, body: &str,
+               tx: &mpsc::Sender<Msg>) -> Result<(), (LlmError, Option<u64>)> {
+    let mut resp = agent.post(url)
+        .header("Authorization", auth)
+        .header("Accept-Encoding", "identity") // compression would buffer deltas
+        .content_type("application/json")
+        .send(body)
+        .map_err(|e| (LlmError::Network(e.to_string()), None))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let retry_after = resp.headers().get("retry-after")
+            .and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+        let text = resp.body_mut().read_to_string().unwrap_or_default();
+        return Err((classify(status, &text), retry_after));
+    }
+    if tx.send(Msg::Open(status)).is_err() { return Ok(()); }
+    let mut reader = BufReader::new(resp.body_mut().as_reader());
+    let mut line = String::new();
+    loop {
+        match reader.read_line(&mut line) {
+            Ok(0) => { let _ = tx.send(Msg::Eof); return Ok(()); }
+            Ok(_) => if tx.send(Msg::Line(std::mem::take(&mut line))).is_err() { return Ok(()); },
+            Err(e) => return Err((LlmError::Network(e.to_string()), None)),
+        }
+    }
+}
+
+/// A stream is complete only if it ended with `[DONE]` or carried a `finish_reason`; otherwise it was cut off.
+fn stream_complete(done: bool, finish_reason: &str) -> bool { done || !finish_reason.is_empty() }
 
 impl Model for ZaiClient {
     fn complete(&mut self, messages: &[Message], tools: &[Value],
@@ -430,6 +493,72 @@ mod tests {
         cfg.reasoning_effort = Some("max".into());
         let b = request_body(&cfg, &msgs, &[json!({"type":"function"})]);
         assert_eq!((b["tools"].as_array().map(Vec::len), b["reasoning_effort"].as_str()), (Some(1), Some("max")));
+    }
+    #[test] fn stream_needs_done_or_finish_reason() {
+        assert!(stream_complete(true, "") && stream_complete(false, "stop"));
+        assert!(!stream_complete(false, ""));
+    }
+
+    /// Localhost server: accepts one connection, reads the whole request, sends `reply`, holds the socket open for `hold`, then closes.
+    fn server(reply: &'static str, hold: Duration) -> ZaiClient {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let (mut head, mut b) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") { s.read_exact(&mut b).unwrap(); head.push(b[0]); }
+            let len = String::from_utf8_lossy(&head).to_lowercase().split("content-length:").nth(1)
+                .and_then(|v| v.lines().next()?.trim().parse().ok()).unwrap_or(0);
+            s.read_exact(&mut vec![0u8; len]).unwrap();
+            s.write_all(reply.as_bytes()).unwrap();
+            std::thread::sleep(hold);
+        });
+        ZaiClient::new(ZaiConfig { base_url, model: "m".into(), api_key: "k".into(), temperature: 1.0, top_p: 0.95, reasoning_effort: None })
+    }
+    const CHUNK_A: &str = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n";
+
+    #[test] fn silent_server_can_be_cancelled() {
+        let mut c = server("", Duration::from_secs(3)); // accepts, then never answers
+        let cancel = AtomicBool::new(false);
+        let t = Instant::now();
+        let r = std::thread::scope(|s| {
+            s.spawn(|| { std::thread::sleep(Duration::from_millis(200)); cancel.store(true, Ordering::Relaxed); });
+            c.complete(&[], &[], &mut |_| {}, &cancel)
+        }).unwrap();
+        assert!(r.interrupted && t.elapsed() < Duration::from_secs(2));
+    }
+    #[test] fn silent_server_trips_idle_timeout_and_retries() {
+        let mut c = server("", Duration::from_secs(3));
+        c.idle = Duration::from_millis(300);
+        let (cancel, mut notices) = (AtomicBool::new(false), Vec::new());
+        let r = c.complete(&[], &[], &mut |d| if let Delta::Notice(n) = d { notices.push(n); cancel.store(true, Ordering::Relaxed) }, &cancel).unwrap();
+        assert_eq!(notices, ["network error: stream stalled; retrying in 1s"]); // nothing emitted, so retryable
+        assert!(r.interrupted);
+    }
+    #[test] fn eof_without_done_or_finish_reason_is_an_error() {
+        // text already streamed: not retryable, surfaces as Network
+        let e = server(CHUNK_A, Duration::ZERO).complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(e, LlmError::Network("stream ended before [DONE]".into()));
+        // headers only, nothing emitted: retried
+        let (cancel, mut notices) = (AtomicBool::new(false), Vec::new());
+        server("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", Duration::ZERO)
+            .complete(&[], &[], &mut |d| if let Delta::Notice(n) = d { notices.push(n); cancel.store(true, Ordering::Relaxed) }, &cancel).unwrap();
+        assert_eq!(notices, ["network error: stream ended before [DONE]; retrying in 1s"]);
+    }
+    #[test] fn http_errors_and_done_flow_through_worker() {
+        let run = |reply: &'static str| server(reply, Duration::ZERO).complete(&[], &[], &mut |_| {}, &AtomicBool::new(false));
+        assert!(matches!(run("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno"), Err(LlmError::Auth(_))));
+        assert!(matches!(run("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"error\":{\"code\":\"1305\"}}\n\n"),
+                         Err(LlmError::Http { status: 200, .. })));
+        let r = run("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n: ka\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n").unwrap();
+        assert_eq!((r.text.as_str(), r.interrupted), ("a", false));
+    }
+    #[test] fn eof_after_finish_reason_is_ok() {
+        let reply = concat!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n");
+        let r = server(reply, Duration::ZERO).complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!((r.text.as_str(), r.finish_reason.as_str(), r.interrupted), ("a", "stop", false));
     }
     #[test] fn backoff_sleep_honors_cancel() {
         assert!(wait(Duration::ZERO, &AtomicBool::new(false)));
