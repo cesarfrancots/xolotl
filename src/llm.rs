@@ -123,6 +123,7 @@ impl ZaiClient {
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
         let mut resp = self.agent.post(&url)
             .header("Authorization", format!("Bearer {}", self.cfg.api_key))
+            .header("Accept-Encoding", "identity") // compression would buffer deltas
             .content_type("application/json")
             .send(body)
             .map_err(|e| (LlmError::Network(e.to_string()), None))?;
@@ -142,6 +143,7 @@ impl ZaiClient {
                 Ok(_) => {}
                 Err(e) => return Err((LlmError::Network(e.to_string()), None)),
             }
+            if let Some(e) = stream_error(status, &line) { return Err((e, None)); }
             match sse_data(&line) {
                 Some("[DONE]") => break,
                 // ponytail: unparseable data lines are skipped; a mid-stream error object is not surfaced until the probe shows its shape.
@@ -238,13 +240,26 @@ pub fn finish(state: StreamState) -> Reply {
 /// Substrings that mark a 400 as a context overflow. Provisional until the API probe records the real body.
 const OVERFLOW_MARKERS: [&str; 5] = ["context", "too long", "max length", "exceed", "1261"];
 
-pub fn classify(status: u16, body: &str) -> LlmError {
+fn overflows(body: &str) -> bool {
     let lower = body.to_lowercase();
+    OVERFLOW_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+pub fn classify(status: u16, body: &str) -> LlmError {
     match status {
         401 | 403 => LlmError::Auth(format!("HTTP {status}: {body}")),
-        400 if OVERFLOW_MARKERS.iter().any(|m| lower.contains(m)) => LlmError::ContextOverflow(body.to_string()),
+        400 if overflows(body) => LlmError::ContextOverflow(body.to_string()),
         _ => LlmError::Http { status, body: body.to_string() },
     }
+}
+
+/// An error reported inside a 2xx stream: a `data:` payload or bare line that is JSON with a top-level `error`.
+fn stream_error(status: u16, line: &str) -> Option<LlmError> {
+    let line = line.trim();
+    let payload = sse_data(line).unwrap_or(line);
+    if serde_json::from_str::<Value>(payload).ok()?["error"].is_null() { return None; }
+    Some(if overflows(payload) { LlmError::ContextOverflow(payload.to_string()) }
+         else { LlmError::Http { status, body: payload.to_string() } })
 }
 
 /// Backoff before retry number `attempt + 1` (0-based `attempt`): `Retry-After` capped at 60 s, else 1/2/4/8 s.
@@ -377,6 +392,17 @@ mod tests {
         assert!(matches!(classify(400, "bad request"), LlmError::Http { status: 400, .. }));
         assert!(matches!(classify(429, ""), LlmError::Http { status: 429, .. }));
         assert!(matches!(classify(500, OVERFLOW_BODY_FROM_NOTES), LlmError::Http { status: 500, .. })); // overflow is 400 only
+    }
+    #[test] fn stream_error_detection() {
+        let e = r#"{"error":{"code":"1305","message":"busy"}}"#;
+        let http200 = Some(LlmError::Http { status: 200, body: e.into() });
+        assert_eq!(stream_error(200, &format!("data: {e}\n")), http200);          // in a data: line
+        assert_eq!(stream_error(200, &format!("{e}\r\n")), http200);              // bare non-SSE line
+        assert!(matches!(stream_error(200, &format!("data: {OVERFLOW_BODY_FROM_NOTES}")), Some(LlmError::ContextOverflow(_))));
+        for ok in [r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#, r#"data: {"error":null,"choices":[]}"#,
+                   "data: [DONE]", ": keepalive", "", "not json"] {
+            assert_eq!(stream_error(200, ok), None, "{ok}");
+        }
     }
     #[test] fn retry_policy() {
         let rl = LlmError::Http { status: 429, body: String::new() };
