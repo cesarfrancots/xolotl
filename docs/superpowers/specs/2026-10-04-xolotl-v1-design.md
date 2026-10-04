@@ -89,15 +89,19 @@ CLI flags are parsed by hand. There is no TUI framework and no tokenizer.
 The v2 optimizer may rewrite `policy.rs` freely, provided these signatures stay compatible. This is the interface check from the paper's Algorithm 1.
 
 ```rust
-pub fn env_snapshot_command(shell: Shell) -> String;
+pub fn env_snapshot_command(shell: &Shell) -> String;
 pub fn system_prompt(env: &str, agents_md: Option<&str>, session_dir: &Path) -> String;
 pub fn build_view(events: &[Event]) -> Vec<Message>;
+pub fn estimate_tokens(events: &[Event]) -> usize;
 pub fn compaction_needed(prompt_tokens: usize, budget: usize, events: &[Event]) -> Option<Compaction>;
+pub fn stage2_cut(events: &[Event], budget: usize) -> Option<Cut>;   // { from_seq, to_seq, mid_turn: bool }; None = nothing to compact
 pub fn summary_prompt(focus: Option<&str>) -> String;
 pub fn table_of_contents(events: &[Event], session_dir: &Path) -> String;
+pub fn summary_message(summary: &str, cut: &Cut, events: &[Event], session_dir: &Path) -> String;
 pub fn cap_output(tool: &str, output: &str) -> Capped;   // { text, truncated: bool }
 pub fn completion_check(original_request: &str) -> String;
 pub const LIMITS: Limits;  // step limit, repeat threshold, recent-tool-results kept, etc.
+pub const RESEND_REASONING: bool;  // set from M0 findings (§16 item 2)
 ```
 
 `meta.json` records `policy_hash`, an FNV-1a hash of `include_str!("policy.rs")`, so every trace links to the exact policy that produced it.
@@ -146,6 +150,8 @@ trait Ui {
     fn tool_start(&mut self, call: &ToolCall);
     fn tool_end(&mut self, call: &ToolCall, result: &ToolResult);
     fn ask(&mut self, req: &PermissionRequest) -> Decision; // Allow | Deny | Always
+    fn confirm(&mut self, question: &str) -> bool;          // step-limit "continue?"; Headless → false
+    fn event(&mut self, e: &Event);                         // every appended event; Headless prints it as a JSON line
     fn notice(&mut self, msg: &str);                        // compaction, retries, errors
     fn status(&mut self, s: &Status);
 }
@@ -240,12 +246,12 @@ Every event is one compact JSON line with `seq`, `t_ms` (unix milliseconds) and 
 
 | `type` | Fields |
 |---|---|
-| `session_start` | `cwd, model, mode, policy_hash` |
+| `session_start` | `cwd, model, mode, policy_hash, system` (the full system prompt, so the trace shows exactly what the model saw and `build_view` stays a pure function of the events) |
 | `user` | `text` |
 | `assistant` | `text, reasoning, tool_calls[{id, name, args}], usage{prompt, completion, cached}, finish_reason, latency_ms` |
 | `tool_result` | `call_id, name, ok, output` (capped), `artifact?, bytes, duration_ms, exit_code?` |
 | `permission` | `call_id, decision: allow\|deny\|always, by: user\|rule\|mode` |
-| `compaction` | `stage: 1\|2, upto_seq` (stage 1), `from_seq, to_seq, summary_path, tokens_before` (stage 2) |
+| `compaction` | `stage: 1\|2, upto_seq` (stage 1), `from_seq, to_seq, summary_path, summary, tokens_before` (stage 2; `summary` is the full text placed in the view) |
 | `nudge` | `reason: completion_check\|repeat\|empty, text`. A harness-written message; `build_view` renders it as a user-role message. |
 | `interrupt` | `during: stream\|tool, call_id?` |
 | `error` | `kind, message, retry` |
@@ -275,7 +281,8 @@ user:    [summary + table of contents from latest stage-2 compaction]           
 
 ### 10.2 Measuring size
 
-- The current size is the last response's `usage.prompt_tokens`, plus `chars / 3` for each event appended since. `chars / 3` deliberately overestimates for code.
+- The current size is the last response's `usage.prompt_tokens + usage.completion_tokens`, plus `chars / 3` for each event appended since. `chars / 3` deliberately overestimates for code.
+- If a compaction happened after the last response, that usage is stale. The size is then `chars / 3` of the whole current view.
 - The budget `B` defaults to 200K and is configurable with `--budget` or the config file.
 
 ### 10.3 Stage 1 — shrink old tool output (no LLM call)
@@ -298,7 +305,12 @@ user:    [summary + table of contents from latest stage-2 compaction]           
 
 **Procedure:**
 
-1. Set `to_seq` to the event just before the second-to-last `user` event, so the last two user turns stay verbatim. `from_seq` is the event after the previous stage-2 range, or 1.
+1. **Choose the cut** with `policy::stage2_cut`. `from_seq` is the event after the previous stage-2 range, or 1. `to_seq` is the first of these whose kept part (estimated `chars / 3`) is ≤ 40% of `B`:
+   - **A:** just before the second-to-last `user` event (keeps the last two user turns verbatim)
+   - **B:** just before the last `user` event
+   - **C:** mid-turn — just before an `assistant` event: the earliest one whose kept part is ≤ 20% of `B`, or else the last `assistant` event
+
+   A cut always lands right before a `user` or `assistant` event, so it never separates a tool call from its result. A cut only counts if `from_seq..=to_seq` contains at least one `user` or `assistant` event. If no cut qualifies, there is nothing to compact. Option C exists because a single request often turns into 100+ tool calls, and then A and B would keep almost everything.
 2. **Summary call:** the current view plus `policy::summary_prompt(focus)`, sent with tools disabled. The model writes markdown with these sections:
    - Goal
    - Current state
@@ -312,8 +324,9 @@ user:    [summary + table of contents from latest stage-2 compaction]           
    - every artifact path
    - the current `todo` list
    - the absolute path of `events.jsonl`
-4. Write it to `summaries/<n>.md` and append `compaction{stage: 2, from_seq, to_seq, summary_path, tokens_before}`.
-5. **Fallback:** if the next view is still ≥ 85% of `B`, repeat with `to_seq` moved to keep only the last user turn verbatim. If that is still too large, tell the user and continue; the API's overflow handling then applies.
+4. **Mid-turn cut:** if the cut was C, the active request (the last `user` event before the cut) is appended in full under `## Current request (verbatim)`. Otherwise the model would lose its task.
+5. Write it to `summaries/<n>.md` and append `compaction{stage: 2, from_seq, to_seq, summary_path, summary, tokens_before}`.
+6. If the summary call fails, append an `error` event, show a notice, and leave the view unchanged. Compaction is never allowed to crash the session.
 
 Nothing is ever deleted. Compaction only changes the view; raw history stays in `events.jsonl` and `artifacts/`.
 
@@ -479,6 +492,7 @@ Each is verified with a direct API call before the code that depends on it is wr
 5. Accepted `reasoning_effort` values and the default.
 6. The exact error code and message for a context overflow.
 7. Whether multiple tool calls per response occur, and whether `parallel_tool_calls` exists. Xolotl handles multiple calls sequentially either way.
+8. Whether a request whose history contains tool calls is accepted without a `tools` parameter. The tools-disabled summary call (§10.4) depends on this. If it isn't, send the tools with `tool_choice: "none"` instead.
 
 ## 17. Sources
 
