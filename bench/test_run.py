@@ -201,6 +201,13 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+class FrozenClock(datetime):
+    """Stands in for `run.datetime`: every run starts at the same minute."""
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 10, 4, 15, 30, 12).astimezone()
+
+
 def fx_task(**over) -> dict:
     """The fx-ok fixture task as loaded from disk, with some fields overridden."""
     return {**run.load_task(TASKS / "fx-ok"), **over}
@@ -218,6 +225,18 @@ class Orchestration(unittest.TestCase):
         if res["kept_dir"]:
             self.addCleanup(lambda p=Path(res["kept_dir"]): run._rm(p))
         return res
+
+    @contextlib.contextmanager
+    def track_mkdtemp(self):
+        """Yield the list of temp dirs the runner creates while the block runs."""
+        made, real = [], tempfile.mkdtemp
+
+        def spy(*a, **k):
+            made.append(real(*a, **k))
+            return made[-1]
+
+        with mock.patch.object(run.tempfile, "mkdtemp", spy):
+            yield made
 
     def quiet_main(self, *argv: str) -> tuple[int, str]:
         out = io.StringIO()
@@ -245,11 +264,13 @@ class Orchestration(unittest.TestCase):
         self.assertEqual(len(made), 1)
         self.assertFalse(os.path.exists(made[0]))  # ... including git's read-only objects
         self.assertIsNone(res["session_dir"])  # the fake writes no session
+        self.assertIn("fake: ok", res["stderr_tail"])  # Xolotl's stderr is kept, not just drained
 
     def test_keep_flag_and_git_setup(self):
         res = self.attempt("ok", keep=True)
         self.assertEqual(res["status"], "pass")
         kept = Path(res["kept_dir"])
+        self.assertFalse((kept / "verify").exists())  # the hidden checks never stay behind in a kept dir
         self.assertTrue((kept / "answer.txt").is_file())
         self.assertTrue((kept / "README.txt").is_file())
         log = subprocess.run(["git", "log", "--format=%an <%ae> %s"], cwd=kept, capture_output=True, text=True, check=True)
@@ -260,9 +281,8 @@ class Orchestration(unittest.TestCase):
         self.assertEqual((res["status"], res["pass"]), ("fail", False))  # the planted always-passing file is not what ran
         kept = Path(res["kept_dir"])
         self.assertTrue(kept.is_dir())  # a failed attempt's dir is kept for inspection
-        self.assertFalse((kept / "verify" / "test_planted.py").exists())
-        self.assertTrue((kept / "verify" / "check.py").is_file())
-        self.assertIn("answer.txt", res["verify_output"])  # the real check failed on the missing file
+        self.assertFalse((kept / "verify").exists())  # neither the planted file nor the real checks are left in a kept dir
+        self.assertIn("answer.txt", res["verify_output"])  # the real check ran (not the planted one) and failed on the missing file
 
     def test_timeout_kills_tree_and_returns_promptly(self):
         t0 = time.monotonic()
@@ -285,6 +305,8 @@ class Orchestration(unittest.TestCase):
         self.assertEqual(res["model_calls"], 1)
         self.assertEqual(res["status"], "fail")
         self.assertFalse(res["timed_out"])
+        self.assertLessEqual(len(res["stderr_tail"].encode()), 1024)  # 5 KB on stderr, last 1 KB kept
+        self.assertTrue(res["stderr_tail"].rstrip().endswith("END"))
 
     def test_missing_toolchain_skips(self):
         boom = AssertionError("must not start any subprocess or temp dir")
@@ -295,6 +317,7 @@ class Orchestration(unittest.TestCase):
         self.assertEqual((res["status"], res["pass"], res["kept_dir"]), ("skipped", False, None))
         self.assertIn("definitely-not-a-real-exe", res["verify_output"])
         self.assertEqual(res["tokens"], {"prompt": 0, "completion": 0, "cached": 0})  # summarize() can read it
+        self.assertEqual(res["stderr_tail"], "")
 
     def test_budget_flag_and_task_override(self):
         def xolotl_argv(runner_budget, **task_over):
@@ -406,6 +429,73 @@ class Orchestration(unittest.TestCase):
         self.assertTrue(res["partial"])
         self.assertEqual(len(res["attempts"]), 1)  # only the attempt that finished
         self.assertFalse((results / "HISTORY.md").exists())  # a partial run never reaches HISTORY.md
+
+    def test_run_id_collision_gets_a_suffix(self):
+        results = self.tmp / "results"
+        fixed_git = lambda *a: "a" * 40 if a[0] == "rev-parse" else ""  # noqa: E731
+        with mock.patch.object(run, "datetime", FrozenClock), mock.patch.object(run, "_git", fixed_git):
+            for note in ("first", "second", "third"):  # same minute, same sha
+                code, _ = self.quiet_main("--tasks-dir", str(TASKS), "--xolotl", str(FAKE), "--note", note,
+                                          "--results-dir", str(results))
+                self.assertEqual(code, 0)
+        base = "20261004-1530-aaaaaaa"
+        self.assertEqual({p.name for p in results.glob("*.json")}, {f"{base}.json", f"{base}-2.json", f"{base}-3.json"})
+        for suffix, note in (("", "first"), ("-2", "second"), ("-3", "third")):  # nothing was overwritten
+            res = json.loads((results / f"{base}{suffix}.json").read_text())
+            self.assertEqual((res["run_id"], res["note"]), (base + suffix, note))
+        rows = (results / "HISTORY.md").read_text().splitlines()[2:]
+        self.assertEqual([r.split("|")[2].strip() for r in rows], [base, f"{base}-2", f"{base}-3"])
+
+    def test_exception_in_an_attempt_keeps_earlier_attempts(self):
+        tasks = self.tmp / "tasks"
+        tasks.mkdir()
+        for name in ("fx-1", "fx-2"):
+            shutil.copytree(TASKS / "fx-ok", tasks / name)
+            task_json = tasks / name / "task.json"
+            task_json.write_text(json.dumps({**json.loads(task_json.read_text()), "id": name}))
+        shutil.rmtree(tasks / "fx-2" / "repo")  # the second task's repo copy raises FileNotFoundError
+        results = self.tmp / "results"
+        err = io.StringIO()
+        with self.track_mkdtemp() as made, contextlib.redirect_stderr(err):
+            code, _ = self.quiet_main("--tasks-dir", str(tasks), "--xolotl", str(FAKE), "--results-dir", str(results))
+        self.assertEqual(code, 1)
+        (path,) = results.glob("*.json")
+        res = json.loads(path.read_text())
+        self.assertTrue(res["partial"])
+        self.assertEqual([a["task"] for a in res["attempts"]], ["fx-1"])  # the finished attempt survives
+        self.assertEqual(res["summary"]["pass"], 1)
+        self.assertIn("fx-2", res["error"])
+        self.assertIn("FileNotFoundError", res["error"])
+        self.assertIn("Traceback", err.getvalue())
+        self.assertFalse((results / "HISTORY.md").exists())  # a partial run never reaches HISTORY.md
+        self.assertEqual(len(made), 2)
+        self.assertFalse(any(os.path.exists(p) for p in made))  # neither attempt left a temp dir behind
+
+    def test_cleanup_error_does_not_mask_interrupt(self):
+        with self.track_mkdtemp() as made, \
+                mock.patch.object(run, "_run_tree", side_effect=KeyboardInterrupt), \
+                mock.patch.object(run, "_rm", side_effect=OSError("locked")):  # e.g. a dying child still holds the dir
+            with self.assertRaises(KeyboardInterrupt):
+                run.run_attempt(fx_task(prompt="ok"), TASKS / "fx-ok", FAKE_CMD, self.home, None, False)
+        self.addCleanup(lambda: run._rm(Path(made[0])))  # the patched _rm left the dir behind
+
+    def test_dirty_ignores_results_dir(self):
+        repo = self.tmp / "repo"
+        (repo / "bench" / "results").mkdir(parents=True)
+        (repo / "bench" / "results" / "HISTORY.md").write_text("header\n")
+        (repo / "tracked.txt").write_text("x")
+        run._init_repo(str(repo))
+        with mock.patch.object(run, "REPO_ROOT", repo):
+            self.assertFalse(run._dirty())
+            (repo / "bench" / "results" / "HISTORY.md").write_text("header\nrow\n")  # tracked file modified by a run
+            (repo / "bench" / "results" / "20261004-1530-abc.json").write_text("{}")  # untracked results file
+            self.assertFalse(run._dirty())
+            (repo / "other.txt").write_text("y")  # any other change counts
+            self.assertTrue(run._dirty())
+            (repo / "other.txt").unlink()
+            self.assertFalse(run._dirty())
+            (repo / "tracked.txt").write_text("changed")
+            self.assertTrue(run._dirty())
 
     def test_main_selfcheck_and_errors(self):
         code, out = self.quiet_main("--selfcheck", "--tasks-dir", str(TASKS))

@@ -1,9 +1,9 @@
 """Stand-in for the xolotl binary, used by bench/test_run.py. The -p prompt picks the behaviour:
 
-ok      write answer.txt = 42 and emit a short event stream
+ok      write answer.txt = 42, a line on stderr, and emit a short event stream
 plant   plant a verify/test_planted.py that always passes, nothing else
 hang    spawn a long-sleeping child, record its pid in child.pid, then sleep too
-garbage print 1 MB of non-JSON bytes, then one assistant event
+garbage print 1 MB of non-JSON bytes, 5 KB on stderr, then one assistant event
 """
 import json
 import subprocess
@@ -30,6 +30,7 @@ def main(argv: list[str]) -> int:
     prompt = argv[argv.index("-p") + 1]
     if prompt == "ok":
         (cwd / "answer.txt").write_text("42", encoding="utf-8")
+        print("fake: ok", file=sys.stderr)
         emit("session_start", cwd=str(cwd), model="fake-model", mode="yolo", policy_hash="fakehash", system="")
         assistant()
         emit("session_end", status="ok")
@@ -44,6 +45,7 @@ def main(argv: list[str]) -> int:
         sys.stdout.flush()
         sys.stdout.buffer.write(b"\xff\xfe garbage \x00" * 70_000 + b"\n")  # ~1 MB, one huge non-UTF-8 line
         sys.stdout.buffer.flush()
+        print("x" * 5000 + "END", file=sys.stderr)  # more than the 1 KB the runner keeps
         assistant()
     return 0
 

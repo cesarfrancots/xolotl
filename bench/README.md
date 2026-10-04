@@ -17,10 +17,12 @@ py -m unittest bench.test_run -v                     # tests for the runner itse
 Other options: `--budget N` (passed to Xolotl as `--budget`; a task's own `budget` wins), `--tasks-dir DIR`.
 Xolotl reads the API key itself; the runner never reads or prints environment variables.
 
-Each run writes `results/<run_id>.json` (`run_id` = `YYYYMMDD-HHMM-<sha7>`) and appends one row to
-`results/HISTORY.md`. Ctrl+C stops cleanly, writes the results with `"partial": true`, and adds no history row.
-A failed attempt's temp directory is kept and its path recorded (`kept_dir`); the session trace stays in `~/.xolotl/`
-(`session_dir`).
+Each run writes `results/<run_id>.json` (`run_id` = `YYYYMMDD-HHMM-<sha7>`, with `-2`, `-3` appended if that file
+already exists, so a run never overwrites another) and appends one row to `results/HISTORY.md`. Ctrl+C, or an error
+in the runner itself, stops the run, writes the finished attempts with `"partial": true` (plus an `error` message for
+an error), and adds no history row. `dirty` is the state of the source tree when the run started, ignoring
+`bench/results/`. A failed attempt's temp directory is kept and its path recorded (`kept_dir`); the hidden `verify/`
+is removed from it. The session trace stays in `~/.xolotl/` (`session_dir`).
 
 ## Add a task
 
@@ -46,6 +48,7 @@ Per attempt, from Xolotl's JSON-lines events: `pass` (every verify command exite
 `wall_s` (Xolotl's run only), `model_calls` (`assistant` events), `tool_calls` (`tool_result` events), `tokens`
 (`prompt` / `completion` / `cached`, summed from `assistant.usage`), `compactions` (`stage1` / `stage2` counts),
 `completion_check` (a `completion_check` nudge happened), `errors` (`error` events), `policy_hash` and `model` (from
-`session_start`). `status` is `pass`, `fail` or `skipped`; skipped attempts count in `total` but not in `pass_rate`.
+`session_start`), `verify_output` and `stderr_tail` (last 2 KB of the checks' output, last 1 KB of Xolotl's stderr).
+`status` is `pass`, `fail` or `skipped`; skipped attempts count in `total` but not in `pass_rate`.
 
 `summary` totals these per run: pass count and rate, `per_task` as `k/N`, summed tokens, median and total wall time.

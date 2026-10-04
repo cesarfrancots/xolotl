@@ -3,6 +3,7 @@
 Standard library only. The pure helpers come first; orchestration (run_attempt, selfcheck, main) lives below them.
 """
 import argparse
+import itertools
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
@@ -287,8 +289,8 @@ def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
     base = {"task": task["id"], "attempt": attempt}
     if missing:
         return {**base, "status": "skipped", "pass": False, "exit_code": None, "timed_out": False, "wall_s": 0.0,
-                "verify_output": f"missing toolchain: {', '.join(missing)}", "kept_dir": None, "session_dir": None,
-                "model": "", **metrics_from_events([])}
+                "verify_output": f"missing toolchain: {', '.join(missing)}", "stderr_tail": "", "kept_dir": None,
+                "session_dir": None, "model": "", **metrics_from_events([])}
 
     tmp = tempfile.mkdtemp(prefix="xolotl-bench-")  # the same string goes to --cwd and session_dir (slug parity)
     try:
@@ -299,10 +301,14 @@ def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
         if budget is not None:
             argv += ["--budget", str(budget)]
         t0 = time.monotonic()
-        exit_code, stdout, _stderr, timed_out = _run_tree(argv, None, task["timeout_s"])
+        exit_code, stdout, stderr, timed_out = _run_tree(argv, None, task["timeout_s"])
         wall_s = round(time.monotonic() - t0, 3)
 
         ok, verify_output = _verify(task, task_dir, Path(tmp))
+        try:  # the hidden checks must not stay in a kept dir, where a later attempt's agent could find them
+            _rm(Path(tmp) / "verify")
+        except OSError:
+            pass
         lines = stdout.decode("utf-8", errors="replace").split("\n")  # not splitlines(): U+2028 may sit inside a JSON string
         model = next((e["model"] for e in _events(lines) if e.get("type") == "session_start" and isinstance(e.get("model"), str)), "")
         sd = session_dir(home, tmp)
@@ -314,11 +320,14 @@ def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
             except OSError:  # locked by a straggler process: the dir is still there, so report it
                 pass
     except BaseException:  # includes Ctrl+C: the attempt is dropped, so don't leave its dir behind
-        _rm(Path(tmp))
+        try:
+            _rm(Path(tmp))
+        except OSError:  # e.g. a dying child still holds the dir; that must not replace the exception being handled
+            pass
         raise
     return {**base, "status": "pass" if ok else "fail", "pass": ok, "exit_code": exit_code, "timed_out": timed_out,
-            "wall_s": wall_s, "verify_output": verify_output, "kept_dir": kept, "session_dir": str(sd) if sd else None,
-            "model": model, **metrics_from_events(lines)}
+            "wall_s": wall_s, "verify_output": verify_output, "stderr_tail": stderr[-1024:].decode("utf-8", errors="replace"),
+            "kept_dir": kept, "session_dir": str(sd) if sd else None, "model": model, **metrics_from_events(lines)}
 
 
 def _last_lines(text: str, n: int = 3, limit: int = 300) -> str:
@@ -376,6 +385,11 @@ def _git(*args: str) -> str:
     return r.stdout.decode("utf-8", errors="replace").strip() if r.returncode == 0 else ""
 
 
+def _dirty() -> bool:
+    """Uncommitted changes in the source tree, not counting bench/results/ (earlier runs write there)."""
+    return bool(_git("status", "--porcelain", "--", ".", ":(exclude)bench/results"))
+
+
 def _print_summary(result: dict, path: Path) -> None:
     s = result["summary"]
     width = max((len(t) for t in s["per_task"]), default=4)
@@ -426,8 +440,12 @@ def main(argv: list[str]) -> int:
             if not built:
                 print("error: cargo build failed", file=sys.stderr)
                 return 1
-            bin_dir = tempfile.mkdtemp(prefix="xolotl-bin-")  # a copy, so a later rebuild can't hit a locked .exe
-            cmd = [shutil.copy2(REPO_ROOT / "target" / "release" / ("xolotl.exe" if os.name == "nt" else "xolotl"), bin_dir)]
+            try:
+                bin_dir = tempfile.mkdtemp(prefix="xolotl-bin-")  # a copy, so a later rebuild can't hit a locked .exe
+                cmd = [shutil.copy2(REPO_ROOT / "target" / "release" / ("xolotl.exe" if os.name == "nt" else "xolotl"), bin_dir)]
+            except OSError as e:
+                print(f"error: cannot copy the built xolotl: {e}", file=sys.stderr)
+                return 1
 
         try:
             v = subprocess.run([*cmd, "--version"], capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
@@ -440,41 +458,55 @@ def main(argv: list[str]) -> int:
 
         started = datetime.now().astimezone()
         sha = _git("rev-parse", "HEAD") or "unknown"
+        dirty = _dirty()  # sampled now, with the sha: the attempts must not change what the run is labelled with
         run_id = f"{started:%Y%m%d-%H%M}-{sha[:7]}"
         total = len(tasks) * args.repeat
         attempts: list[dict] = []
-        partial = False
+        exit_code, error, where = 0, "", ""
         try:
             for task, task_dir in tasks:
                 for i in range(1, args.repeat + 1):
+                    where = f"{task['id']} #{i}"
                     a = run_attempt(task, task_dir, cmd, Path.home(), args.budget, args.keep, i)
                     attempts.append(a)
                     note = f" ({a['verify_output']})" if a["status"] == "skipped" else " (timed out)" if a["timed_out"] else ""
-                    print(f"[{len(attempts)}/{total}] {task['id']} #{i}: {a['status']:<7} {a['wall_s']:7.1f}s  "
+                    print(f"[{len(attempts)}/{total}] {where}: {a['status']:<7} {a['wall_s']:7.1f}s  "
                           f"{a['model_calls']} model calls{note}", flush=True)
         except KeyboardInterrupt:
-            partial = True
+            exit_code = 130
             print("\ninterrupted: writing partial results", flush=True)
+        except Exception as e:  # any attempt-level failure must not discard the attempts that already finished
+            exit_code, error = 1, f"{where}: {type(e).__name__}: {e}"
+            traceback.print_exc()
+            print(f"error: attempt {where} failed; writing partial results", file=sys.stderr)
+        partial = exit_code != 0
 
         result = {
-            "run_id": run_id, "started": started.isoformat(timespec="seconds"), "git_sha": sha,
-            "dirty": bool(_git("status", "--porcelain")),
+            "run_id": run_id, "started": started.isoformat(timespec="seconds"), "git_sha": sha, "dirty": dirty,
             "xolotl_version": v.stdout.decode("utf-8", errors="replace").strip(),
             "model": next((a["model"] for a in attempts if a["model"]), ""),
             "policy_hash": next((a["policy_hash"] for a in attempts if a["policy_hash"]), ""),
             "repeat": args.repeat, "budget": args.budget, "note": args.note, "partial": partial,
+            **({"error": error} if error else {}),
             "attempts": attempts, "summary": summarize(attempts),
         }
         args.results_dir.mkdir(parents=True, exist_ok=True)
-        path = args.results_dir / f"{run_id}.json"
-        path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
+        for n in itertools.count(1):  # exclusive create: never overwrite an earlier run's file, suffix -2, -3 instead
+            result["run_id"] = run_id if n == 1 else f"{run_id}-{n}"
+            path = args.results_dir / f"{result['run_id']}.json"
+            try:
+                with path.open("x", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps(result, indent=2) + "\n")
+                break
+            except FileExistsError:
+                continue
         if not partial:
             history = args.results_dir / "HISTORY.md"
             header = HISTORY_HEADER if not history.exists() or history.stat().st_size == 0 else ""
             with history.open("a", encoding="utf-8", newline="\n") as f:
                 f.write(header + history_row(result) + "\n")
         _print_summary(result, path)
-        return 130 if partial else 0
+        return exit_code
     finally:
         if bin_dir:
             shutil.rmtree(bin_dir, ignore_errors=True)
