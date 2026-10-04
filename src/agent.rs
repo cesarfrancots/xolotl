@@ -12,6 +12,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+/// How an `Outcome::Error` (or a `/compact` error) from a failed session write starts. After one, the events file may end
+/// in a partial line, so nothing more may be appended to that session.
+pub const SESSION_WRITE_FAILED: &str = "cannot write session";
 const CANCELLED: &str = "cancelled by user";
 const HEADLESS_DENIED: &str = "denied: not allowed in headless mode (use --mode or --allow)";
 const EMPTY_NUDGE: &str = "(empty response — continue the task, or reply with your answer)";
@@ -370,7 +373,7 @@ impl Agent<'_> {
 
     /// Every event goes to disk, then to the Ui.
     fn append(&mut self, kind: Kind) -> Result<(), Outcome> {
-        let e = self.session.append(kind).map_err(|e| Outcome::Error(format!("cannot write session: {e}")))?;
+        let e = self.session.append(kind).map_err(|e| Outcome::Error(format!("{SESSION_WRITE_FAILED}: {e}")))?;
         self.ui.event(&e);
         Ok(())
     }

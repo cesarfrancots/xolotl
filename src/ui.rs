@@ -110,7 +110,7 @@ fn skip_osc(cs: &[char], mut i: usize) -> usize {
 
 /// Text that is safe to print: model and tool output must not be able to move the cursor, clear or recolor the
 /// screen, or retitle the window, because a prompt has to show what will actually run. Strips ANSI escape
-/// sequences (CSI, OSC, any other `ESC x`, and the 8-bit CSI), drops `\r`, and turns every other control
+/// sequences (CSI, OSC, any other `ESC x`, and the 8-bit CSI), drops `\r` and the bidi controls, and turns every other control
 /// character except `\n` and `\t` into `·`. A sequence split across two streamed chunks loses its ESC, so the
 /// rest of it prints as harmless text.
 fn sanitize(s: &str) -> String {
@@ -128,7 +128,8 @@ fn sanitize(s: &str) -> String {
                 None => {}
             },
             '\u{9b}' => i = skip_csi(&cs, i),
-            '\r' => {}
+            // bidi controls reorder what is shown (U+200D, the emoji joiner, is not one of them)
+            '\r' | '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {}
             '\n' | '\t' => out.push(c),
             c if c.is_control() => out.push('·'),
             c => out.push(c),
@@ -603,6 +604,18 @@ mod tests {
         let nasty: String = (0u32..0x200).filter_map(char::from_u32).collect();
         let clean = sanitize(&nasty);
         assert!(clean.chars().all(|c| !c.is_control() || c == '\n' || c == '\t'), "{clean:?}");
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_controls() {
+        // reordering marks could make a prompt show a command other than the one that runs
+        for c in ['\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}'] {
+            assert_eq!(sanitize(&format!("a{c}b")), "ab", "U+{:04X}", c as u32);
+        }
+        // the zero-width joiner holds emoji sequences together, so it stays; so do the code points around the ranges
+        for kept in ["👨\u{200D}👩\u{200D}👧", "a\u{200D}b", "\u{2029}\u{2065}\u{206A}\u{2010}", "\u{061B}\u{061D}"] {
+            assert_eq!(sanitize(kept), kept);
+        }
     }
 
     #[test]

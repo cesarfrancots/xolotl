@@ -28,7 +28,7 @@ use std::time::Duration;
 use std::{env, fs};
 use store::{Event, Kind, Meta, Session};
 use tools::{Shell, ToolCtx};
-use ui::{Headless, Status, Terminal, status_line};
+use ui::{Headless, Status, Terminal, Ui, status_line};
 
 /// Set by Ctrl+C: cancels the running stream or tool. While the line editor reads input, the terminal is in raw
 /// mode and Ctrl+C arrives as a key instead (it clears the line).
@@ -49,6 +49,7 @@ const HELP: &str = "\
 /status                   context use, tool calls, time and cache hits
 /exit                     quit (also Ctrl+D)
 Alt+Enter inserts a newline. Ctrl+C clears the line, or cancels a running request.";
+const UNWRITABLE: &str = "this session can no longer be written — /clear starts a new one (or /resume another), or restart xolotl";
 const HISTORY_SIZE: usize = 1000;
 /// Sessions `/resume` lists to pick from.
 const RESUME_LIST: usize = 10;
@@ -280,7 +281,8 @@ fn run() -> Result<ExitCode, String> {
         let branch = git(&ctx.cwd, &["branch", "--show-current"]).map(|b| format!(" ({b})")).unwrap_or_default();
         println!("xolotl · {} · {}{branch} · mode: {}", ctx.model, ctx.cwd.display(), mode.as_str());
     }
-    let session = match &args.resume {
+    // `startup`: index of the first event this process appended before any request (all of a new session's)
+    let (session, startup) = match &args.resume {
         Some(id) => {
             let sessions = store::list_sessions(&ctx.root, &ctx.cwd);
             let dir = match id {
@@ -289,7 +291,7 @@ fn run() -> Result<ExitCode, String> {
             };
             open_session(&dir)?
         }
-        None => new_session(&ctx, mode)?,
+        None => (new_session(&ctx, mode)?, 0),
     };
     let mut model = ZaiClient::new(ZaiConfig {
         base_url: cfg.base_url,
@@ -300,7 +302,7 @@ fn run() -> Result<ExitCode, String> {
         reasoning_effort: cfg.reasoning_effort,
     });
     Ok(match &args.prompt {
-        Some(task) => headless(&ctx, session, &mut model, mode, task),
+        Some(task) => headless(&ctx, session, startup, &mut model, mode, task),
         None => {
             if args.resume.is_some() {
                 println!("resumed {}", session.meta.id);
@@ -347,11 +349,12 @@ fn new_session(ctx: &Ctx, mode: Mode) -> Result<Session, String> {
 }
 
 /// Opens a session to continue it: a cut-off last line is dropped, unanswered tool calls get a result, and it
-/// reads as running again.
-fn open_session(dir: &Path) -> Result<Session, String> {
+/// reads as running again. Also returns the index of the first event the repair appended.
+fn open_session(dir: &Path) -> Result<(Session, usize), String> {
     let mut s = Session::open(dir).map_err(|e| format!("cannot open {}: {e}", dir.display()))?;
+    let before = s.events.len();
     s.repair_dangling().and_then(|_| s.reopen()).map_err(|e| format!("cannot repair {}: {e}", dir.display()))?;
-    Ok(s)
+    Ok((s, before))
 }
 
 fn by_id(sessions: Vec<PathBuf>, id: &str) -> Result<PathBuf, String> {
@@ -368,11 +371,11 @@ fn tool_ctx(ctx: &Ctx, s: &Session) -> ToolCtx {
     }
 }
 
-/// `-p`: one request, every event as a JSON line on stdout. Exit 0 when the agent finished, 2 at the step limit,
-/// 1 otherwise.
-fn headless(ctx: &Ctx, session: Session, model: &mut ZaiClient, mode: Mode, task: &str) -> ExitCode {
+/// `-p`: one request, every event as a JSON line on stdout (from `session.events[startup..]`, appended before the
+/// request). Exit 0 when the agent finished, 2 at the step limit, 1 otherwise.
+fn headless(ctx: &Ctx, session: Session, startup: usize, model: &mut ZaiClient, mode: Mode, task: &str) -> ExitCode {
     eprintln!("session: {}", session.dir.display());
-    let mut ui = Headless { out: io::stdout() };
+    let mut ui = headless_ui(io::stdout(), &session.events[startup..]);
     let perms = Perms::new(mode, true, session.dir.clone(), ctx.allow.clone());
     let tools = tool_ctx(ctx, &session);
     let mut agent = Agent { session, model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
@@ -390,6 +393,16 @@ fn headless(ctx: &Ctx, session: Session, model: &mut ZaiClient, mode: Mode, task
         agent.ui.event(end); // `session_end` is appended outside the agent
     }
     ExitCode::from(code)
+}
+
+/// The headless Ui, with `startup` (the events appended before the agent existed, such as `session_start`) already
+/// written, so the stream holds every event this run appended.
+fn headless_ui<W: Write>(out: W, startup: &[Event]) -> Headless<W> {
+    let mut ui = Headless { out };
+    for e in startup {
+        ui.event(e);
+    }
+    ui
 }
 
 /// Tab completion over the slash commands. The completer's trie stops at any char that isn't alphanumeric or an
@@ -467,6 +480,8 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
     let mut term = Terminal::new(false, &CANCEL);
     let mut perms = Perms::new(mode, false, session.dir.clone(), ctx.allow.clone());
     let mut tools = tool_ctx(ctx, &session);
+    // a write to `session` failed, so its file may end in a partial line: no more requests until /clear or /resume
+    let mut unwritable = false;
     let code = loop {
         let line = match editor.read_line(&prompt) {
             Ok(Signal::Success(line)) => with_pasted_rest(line),
@@ -482,10 +497,20 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
         }
         // The agent owns the session, permissions and tool state while it runs, and hands them back after.
         let Some(cmd) = parse_slash(&line) else {
+            if unwritable {
+                term.notice(UNWRITABLE);
+                continue;
+            }
             let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
-            agent.run_request(&line);
+            let outcome = agent.run_request(&line);
             Agent { session, perms, tools, .. } = agent;
             println!();
+            if let Outcome::Error(e) = outcome
+                && session_unwritable(&e)
+            {
+                unwritable = true;
+                term.notice(UNWRITABLE);
+            }
             continue;
         };
         let next = match cmd {
@@ -517,17 +542,26 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
                 println!("{}", status_line(&session_status(&session, ctx.budget)));
                 None
             }
+            Slash::Compact(_) if unwritable => {
+                term.notice(UNWRITABLE); // a compaction appends to the session too
+                None
+            }
             Slash::Compact(focus) => {
                 CANCEL.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
                 let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
-                if let Err(e) = agent.compact(focus.as_deref()) {
-                    agent.ui.notice(&e);
-                }
+                let result = agent.compact(focus.as_deref());
                 Agent { session, perms, tools, .. } = agent;
+                if let Err(e) = result {
+                    term.notice(&e);
+                    if session_unwritable(&e) {
+                        unwritable = true;
+                        term.notice(UNWRITABLE);
+                    }
+                }
                 None
             }
             Slash::Clear => Some(new_session(ctx, perms.mode)),
-            Slash::Resume(id) => Some(choose_session(ctx, &session.dir, id.as_deref()).and_then(|dir| open_session(&dir))),
+            Slash::Resume(id) => Some(choose_session(ctx, &session.dir, id.as_deref()).and_then(|dir| open_session(&dir)).map(|(s, _)| s)),
             Slash::Unknown(c) => {
                 println!("unknown command /{c} (/help lists them)");
                 None
@@ -539,6 +573,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
                     eprintln!("cannot write the session: {e}");
                 }
                 session = next;
+                unwritable = false;
                 // "always" grants and read records belong to a session
                 perms = Perms::new(perms.mode, false, session.dir.clone(), ctx.allow.clone());
                 tools = tool_ctx(ctx, &session);
@@ -555,6 +590,11 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
             ExitCode::FAILURE
         }
     }
+}
+
+/// True for the error of a failed session write (from a request or `/compact`).
+fn session_unwritable(error: &str) -> bool {
+    error.starts_with(agent::SESSION_WRITE_FAILED)
 }
 
 /// `/status`: the whole session so far.
@@ -780,6 +820,57 @@ mod tests {
         assert_eq!(values("/c"), ["/clear", "/compact"]);
         assert_eq!(values("/re"), ["/resume"]);
         assert!(values("hel").is_empty());
+    }
+
+    fn test_session(tag: &str) -> Session {
+        let dir = test_dir(tag);
+        let meta = Meta {
+            id: "20260101-000000-0001".into(),
+            cwd: dir.join("proj").display().to_string(),
+            git_head: None,
+            model: "m".into(),
+            mode: "writes".into(),
+            policy_hash: "h".into(),
+            started_ms: 0,
+            ended_ms: None,
+            status: "running".into(),
+        };
+        let mut s = Session::create(&dir.join("home"), meta).unwrap();
+        s.append(Kind::SessionStart { cwd: "/w".into(), model: "m".into(), mode: "writes".into(), policy_hash: "h".into(), system: "S".into() })
+            .unwrap();
+        s
+    }
+    fn streamed(out: &[u8]) -> Vec<Event> {
+        std::str::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn headless_stream_starts_with_session_start() {
+        // a new session: `session_start` was appended before the Ui existed, and still opens the stream
+        let s = test_session("headless-new");
+        let ui = headless_ui(Vec::new(), &s.events[0..]);
+        let lines = streamed(&ui.out);
+        assert_eq!(lines, s.events);
+        assert!(matches!(lines[0].kind, Kind::SessionStart { .. }), "{lines:?}");
+
+        // a resumed session: only what the repair appended at startup (a result for the dangling call), not the old history
+        let mut s = test_session("headless-resume");
+        s.append(Kind::User { text: "go".into() }).unwrap();
+        let call = llm::ToolCall { id: "c1".into(), name: "read".into(), args: "{}".into() };
+        let reply = Kind::Assistant { text: String::new(), reasoning: String::new(), tool_calls: vec![call], usage: llm::Usage::default(), finish_reason: "tool_calls".into(), latency_ms: 0 };
+        s.append(reply).unwrap();
+        let (s, startup) = open_session(&s.dir).unwrap();
+        assert_eq!(startup, 3);
+        let lines = streamed(&headless_ui(Vec::new(), &s.events[startup..]).out);
+        assert_eq!(lines, s.events[3..]);
+        assert!(matches!(&lines[..], [Event { kind: Kind::ToolResult { call_id, .. }, .. }] if call_id == "c1"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_failed_session_write_is_recognized() {
+        assert!(session_unwritable(&format!("{}: disk full", agent::SESSION_WRITE_FAILED)));
+        assert!(!session_unwritable("network error: reset"));
+        assert!(!session_unwritable("compaction failed: cannot write summary: x"));
     }
 
     #[test]
