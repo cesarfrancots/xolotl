@@ -304,9 +304,9 @@ pub fn finish(state: StreamState) -> Reply {
     Reply { tool_calls: state.calls.into_values().collect(), ..state.reply }
 }
 
-/// HTTP 429 business codes that are permanent, not transient (docs/glm-api-notes.md "Retry caution"):
-/// no balance, period limit, plan expired, weekly/monthly limit, plan lacks the model.
-const QUOTA_CODES: [&str; 5] = ["1113", "1308", "1309", "1310", "1311"];
+/// The only HTTP 429 business codes worth retrying: rate limit (1302) and service overloaded (1305). Every other
+/// code on a 429 is permanent (no balance, plan expired, period limit, fair use, ...; docs/glm-api-notes.md "Retry caution").
+const TRANSIENT_429_CODES: [&str; 2] = ["1302", "1305"];
 
 /// `error.code` of a Z.ai error envelope. The API sends a string; a number is accepted too.
 fn error_code(v: &Value) -> Option<String> {
@@ -327,11 +327,12 @@ fn overflows(body: &str) -> bool {
     }
 }
 
-/// The message of a permanent-quota 429 body (see `QUOTA_CODES`), or None for any other body.
+/// The message of a permanent 429 body: it has an `error.code` that is not in `TRANSIENT_429_CODES`.
+/// None for transient codes and for bodies with no parseable code.
 fn quota_message(body: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
-    QUOTA_CODES.contains(&error_code(&v)?.as_str())
-        .then(|| v["error"]["message"].as_str().unwrap_or(body).to_string())
+    let code = error_code(&v)?;
+    (!TRANSIENT_429_CODES.contains(&code.as_str())).then(|| v["error"]["message"].as_str().unwrap_or(body).to_string())
 }
 
 pub fn classify(status: u16, body: &str) -> LlmError {
@@ -510,15 +511,19 @@ mod tests {
         let LlmError::Quota(msg) = classify(429, QUOTA_BODY_FROM_NOTES) else { panic!("1113 should be Quota") };
         assert_eq!(msg, "Insufficient balance or no resource package. Please recharge.");
         assert_eq!(LlmError::Quota(msg).to_string(), "quota or balance exhausted: Insufficient balance or no resource package. Please recharge.");
-        for code in ["1113", "1308", "1309", "1310", "1311"] {
+        // every 429 code except the transient 1302/1305 is permanent (docs/glm-api-notes.md "Retry caution")
+        for code in ["1113", "1308", "1309", "1310", "1311", "1313", "1316", "1321", "9999"] {
             let body = format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#);
             assert_eq!(classify(429, &body), LlmError::Quota("m".into()), "{code}");
         }
-        assert_eq!(classify(429, r#"{"error":{"code":1308,"message":"m"}}"#), LlmError::Quota("m".into())); // numeric code
-        // transient rate limits and other statuses stay plain Http, and are still retried
-        let rate = classify(429, r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#);
-        assert!(matches!(rate, LlmError::Http { status: 429, .. }));
-        assert_eq!(retry_delay(&rate, 0, false, None), Some(Duration::from_secs(1)));
+        assert_eq!(classify(429, r#"{"error":{"code":1316,"message":"m"}}"#), LlmError::Quota("m".into())); // numeric code
+        // transient codes, no parseable code, and other statuses stay plain Http, and 429s are still retried
+        for body in [r#"{"error":{"code":"1302","message":"Rate limit reached"}}"#, r#"{"error":{"code":1305,"message":"busy"}}"#,
+                     r#"{"error":{"message":"no code"}}"#, "<html>Too Many Requests</html>", ""] {
+            let e = classify(429, body);
+            assert!(matches!(e, LlmError::Http { status: 429, .. }), "{body}");
+            assert_eq!(retry_delay(&e, 0, false, None), Some(Duration::from_secs(1)), "{body}");
+        }
         assert!(matches!(classify(400, QUOTA_BODY_FROM_NOTES), LlmError::Http { status: 400, .. }));
         assert_eq!(retry_delay(&LlmError::Quota("x".into()), 0, false, None), None);
         assert_eq!(retry_delay(&LlmError::Quota("x".into()), 0, false, Some(5)), None);
