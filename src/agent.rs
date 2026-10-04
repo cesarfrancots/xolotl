@@ -1,9 +1,9 @@
 //! The turn loop (spec §11, §12): for each user request, build the view from the events, stream the model call,
 //! run tool calls through permissions, record every step as an event, and apply the loop guards.
 
-use crate::llm::{Delta, LlmError, Model, Reply, ToolCall};
+use crate::llm::{Delta, LlmError, Message, Model, Reply, ToolCall};
 use crate::perms::{Perms, Verdict};
-use crate::policy::{self, LIMITS};
+use crate::policy::{self, Compaction, LIMITS};
 use crate::store::{Kind, Session};
 use crate::tools::{self, ToolCtx};
 use crate::ui::{Decision, PermissionRequest, Status, Ui, mini_diff, tool_summary};
@@ -67,10 +67,105 @@ impl Agent<'_> {
         outcome
     }
 
-    /// Stage-2 compaction (spec §10.4).
-    // ponytail: stub until Task 12 wires compaction in; until then a context overflow ends the request.
-    pub fn compact(&mut self, _focus: Option<&str>) -> Result<(), String> {
-        Err("compaction not implemented".into())
+    /// Stage-2 compaction for `/compact [focus]` (spec §10.4). A failure is recorded as an `error` event and leaves
+    /// the view unchanged; its message comes back for the caller to show.
+    pub fn compact(&mut self, focus: Option<&str>) -> Result<(), String> {
+        self.cancel.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
+        match self.stage2(focus) {
+            Ok(result) => result,
+            Err(Outcome::Error(fatal)) => Err(fatal),
+            Err(other) => unreachable!("a failed session write is always Outcome::Error, got {other:?}"),
+        }
+    }
+
+    /// The compaction triggers (spec §10.2–10.4), checked after each batch of tool calls.
+    fn compact_if_needed(&mut self) -> Result<(), Outcome> {
+        let tokens = policy::estimate_tokens(&self.session.events);
+        match policy::compaction_needed(tokens, self.budget, &self.session.events) {
+            None => {}
+            Some(Compaction::Stage1 { upto_seq }) => {
+                let kind = Kind::Compaction {
+                    stage: 1,
+                    upto_seq: Some(upto_seq),
+                    from_seq: None,
+                    to_seq: None,
+                    summary_path: None,
+                    summary: None,
+                    tokens_before: None,
+                };
+                self.append(kind)?;
+                self.ui.notice(&format!("compacted: elided old tool output (≤ seq {upto_seq})"));
+            }
+            Some(Compaction::Stage2) => {
+                if let Err(e) = self.stage2(None)? {
+                    self.ui.notice(&e); // the loop goes on with the view unchanged
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage 2 (spec §10.4). `Ok(Err(msg))`: the compaction failed; it is recorded as an `error` event and the view is
+    /// unchanged. `Err`: a failed session write, as with `append`.
+    fn stage2(&mut self, focus: Option<&str>) -> Result<Result<(), String>, Outcome> {
+        let events = &self.session.events;
+        let Some(cut) = policy::stage2_cut(events, self.budget) else {
+            self.ui.notice("nothing to compact");
+            return Ok(Ok(()));
+        };
+        let tokens_before = policy::estimate_tokens(events) as u64;
+        let mut view = policy::build_view(events);
+        let prompt = policy::summary_prompt(focus);
+        match view.last_mut() {
+            // the view never holds two user messages in a row
+            Some(Message::User(last)) => {
+                last.push_str("\n\n");
+                last.push_str(&prompt);
+            }
+            _ => view.push(Message::User(prompt)),
+        }
+        // Tools disabled: the API accepts a history with tool calls without them (spec §16 item 8). The summary is not an
+        // answer, so only notices reach the Ui.
+        let ui = &mut *self.ui;
+        let reply = self.model.complete(
+            &view,
+            &[],
+            &mut |d| {
+                if let Delta::Notice(n) = d {
+                    ui.notice(&n)
+                }
+            },
+            self.cancel,
+        );
+        let written = match reply {
+            Err(e) => Err(e.to_string()),
+            Ok(r) if r.interrupted => Err("interrupted".to_string()),
+            Ok(r) if r.text.trim().is_empty() => Err("empty summary".to_string()),
+            Ok(r) => {
+                let summary = policy::summary_message(&r.text, &cut, &self.session.events, &self.session.dir);
+                self.session.write_summary(&summary).map(|path| (summary, path)).map_err(|e| format!("cannot write summary: {e}"))
+            }
+        };
+        let (summary, path) = match written {
+            Ok(w) => w,
+            Err(e) => {
+                let message = format!("compaction failed: {e}");
+                self.append(Kind::Error { kind: "compaction".into(), message: message.clone(), retry: false })?;
+                return Ok(Err(message));
+            }
+        };
+        let (from_seq, to_seq, summary_path) = (cut.from_seq, cut.to_seq, path.display().to_string());
+        self.append(Kind::Compaction {
+            stage: 2,
+            upto_seq: None,
+            from_seq: Some(from_seq),
+            to_seq: Some(to_seq),
+            summary_path: Some(summary_path.clone()),
+            summary: Some(summary),
+            tokens_before: Some(tokens_before),
+        })?;
+        self.ui.notice(&format!("compacted: summary of events {from_seq}–{to_seq} → {summary_path}"));
+        Ok(Ok(()))
     }
 
     /// The loop of spec §11. `Err` is a failed session write, which ends the request at once: nothing may be
@@ -107,10 +202,11 @@ impl Agent<'_> {
             );
             let reply = match result {
                 Ok(reply) => reply,
-                Err(LlmError::ContextOverflow(_)) if !overflow_retried => {
+                Err(e @ LlmError::ContextOverflow(_)) if !overflow_retried => {
                     overflow_retried = true;
-                    if let Err(e) = self.compact(None) {
-                        self.append(Kind::Error { kind: "compaction".into(), message: e.clone(), retry: false })?;
+                    // the trace records why the history is compacted; then the request is retried once
+                    self.append(Kind::Error { kind: "llm".into(), message: e.to_string(), retry: true })?;
+                    if let Err(e) = self.stage2(None)? {
                         self.ui.notice(&e);
                         return Ok(Outcome::Error(e));
                     }
@@ -166,6 +262,11 @@ impl Agent<'_> {
                 if cancelled {
                     return self.interrupt(&calls[i + 1..], "tool", Some(&call.id));
                 }
+            }
+
+            // after a Ctrl+C the top of the loop ends the request; a summary call now would only be cut short
+            if !self.cancel.load(Ordering::SeqCst) {
+                self.compact_if_needed()?;
             }
 
             let n = LIMITS.repeat_threshold;
@@ -459,6 +560,45 @@ mod tests {
             Some(Message::User(t)) => t.clone(),
             other => panic!("last message is not a user message: {other:?}"),
         }
+    }
+    /// A read of `f{i}.txt` (a distinct file each time, so the repeat guard stays quiet) whose reply reports `prompt` tokens.
+    fn read_f(i: usize, prompt: u64) -> Result<Reply, LlmError> {
+        let reply = call(&format!("c{i}"), "read", &format!(r#"{{"path":"f{i}.txt"}}"#)).unwrap();
+        Ok(Reply { usage: Usage { prompt, ..Usage::default() }, ..reply })
+    }
+    fn write_files(root: &Path, n: usize, content: &str) {
+        for i in 1..=n {
+            fs::write(root.join(format!("f{i}.txt")), content).unwrap();
+        }
+    }
+    fn compactions(events: &[Event]) -> Vec<&Event> {
+        events.iter().filter(|e| matches!(e.kind, Kind::Compaction { .. })).collect()
+    }
+    fn stages(events: &[Event]) -> Vec<u8> {
+        compactions(events).iter().filter_map(|e| if let Kind::Compaction { stage, .. } = e.kind { Some(stage) } else { None }).collect()
+    }
+    /// `(message, retry)` of every error event of `kind`.
+    fn errors(events: &[Event], kind: &str) -> Vec<(String, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Error { kind: k, message, retry } if k == kind => Some((message.clone(), *retry)),
+                _ => None,
+            })
+            .collect()
+    }
+    /// A finished earlier request (R6), so a stage-2 cut has something to cover.
+    fn seed_earlier_turn(a: &mut Agent<'_>) {
+        a.session.append(Kind::User { text: "earlier".into() }).unwrap();
+        let reply = Kind::Assistant {
+            text: "ok".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            usage: Usage::default(),
+            finish_reason: "stop".into(),
+            latency_ms: 0,
+        };
+        a.session.append(reply).unwrap();
     }
 
     #[test]
@@ -832,5 +972,206 @@ mod tests {
         // everything after the helper's SessionStart was appended by the agent, and each one reached the Ui
         assert_eq!(ui.events, session.events[1..]);
         assert_eq!(ui.events.len(), 9); // user, 2 × (assistant, result), permission, assistant, nudge, assistant
+    }
+
+    // ---- compaction (Task 12) ----
+
+    #[test]
+    fn stage1_fires_and_stubs() {
+        // budget 3_000: 11 small reads, a 12th whose reply reports 1_900 tokens (≥ 60%), a 13th back at 1_000, then the answer
+        let mut script: Vec<_> = (1..=11).map(|i| read_f(i, 100)).collect();
+        script.extend([read_f(12, 1_900), read_f(13, 1_000), text("done")]);
+        let mut m = Scripted::new(script);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("stage1", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        a.budget = 3_000;
+        write_files(&a.tools.root, 13, "x");
+        assert_eq!(a.run_request("read them"), Outcome::Done);
+        let session = a.session;
+
+        let result_seqs: Vec<u64> = session.events.iter().filter(|e| matches!(e.kind, Kind::ToolResult { .. })).map(|e| e.seq).collect();
+        let upto = result_seqs[1]; // the 11th-most-recent of 12 results
+        let c = compactions(&session.events);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].kind,
+            Kind::Compaction { stage: 1, upto_seq: Some(upto), from_seq: None, to_seq: None, summary_path: None, summary: None, tokens_before: None }
+        );
+        assert_eq!(ui.notices, [format!("compacted: elided old tool output (≤ seq {upto})")]);
+        assert_eq!(m.requests.len(), 14); // no summary call
+        // the request after it shows results 1 and 2 as stubs, the other ten verbatim
+        let tool_texts: Vec<&str> =
+            m.requests[12].0.iter().filter_map(|m| if let Message::Tool { content, .. } = m { Some(content.as_str()) } else { None }).collect();
+        assert_eq!(tool_texts.len(), 12);
+        assert!(tool_texts[..2].iter().all(|t| t.starts_with("[elided:")), "{tool_texts:?}");
+        assert!(tool_texts[2..].iter().all(|t| !t.contains("[elided:")), "{tool_texts:?}");
+        assert!(m.requests[11].0.iter().all(|m| !matches!(m, Message::Tool { content, .. } if content.contains("[elided:"))));
+    }
+
+    #[test]
+    fn stage2_after_failed_stage1() {
+        // as above, but the 13th reply is still at 1_900 (≥ 60% right after stage 1): stage 2, whose summary is "SUM"
+        let mut script: Vec<_> = (1..=11).map(|i| read_f(i, 100)).collect();
+        script.extend([read_f(12, 1_900), read_f(13, 1_900), text("SUM"), text("done")]);
+        let mut m = Scripted::new(script);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("stage2", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        a.budget = 3_000;
+        write_files(&a.tools.root, 13, "x");
+        assert_eq!(a.run_request("read them"), Outcome::Done);
+        let session = a.session;
+
+        assert_eq!(m.requests.len(), 15);
+        let (summary_view, tool_count) = &m.requests[13];
+        assert_eq!(*tool_count, 0); // tools disabled
+        assert_eq!(summary_view.last(), Some(&Message::User(policy::summary_prompt(None))));
+        assert_eq!(stages(&session.events), [1, 2]);
+        let c = compactions(&session.events)[1];
+        let Kind::Compaction { from_seq: Some(from), to_seq: Some(to), summary_path: Some(path), summary: Some(summary), tokens_before: Some(tokens), .. } =
+            &c.kind
+        else {
+            panic!("incomplete stage-2 event: {c:?}")
+        };
+        assert!(summary.contains("SUM") && summary.contains("## Table of contents"), "{summary}");
+        assert_eq!(Path::new(path), session.dir.join("summaries").join("1.md"));
+        assert_eq!(&fs::read_to_string(path).unwrap(), summary);
+        // the size measured just before the compaction event was appended
+        assert_eq!(*tokens, policy::estimate_tokens(&session.events[..c.seq as usize - 1]) as u64);
+        assert_eq!(ui.notices.last().unwrap(), &format!("compacted: summary of events {from}–{to} → {path}"));
+        assert_eq!(ui.text, "done"); // the summary is not streamed as an answer
+        // the next request starts from the summary
+        let next = &m.requests[14].0;
+        assert_eq!(next[0], Message::System("S".into()));
+        assert_eq!(next[1], Message::User(summary.clone()));
+    }
+
+    #[test]
+    fn manual_compact_with_focus() {
+        let mut m = Scripted::new(vec![text("SUM")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(true)); // a Ctrl+C from an earlier request must not cut the summary
+        let mut a = agent("focus", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        seed_earlier_turn(&mut a);
+        assert_eq!(a.compact(Some("parser")), Ok(()));
+        let session = a.session;
+
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert_eq!(m.requests.len(), 1);
+        assert_eq!(m.requests[0].1, 0);
+        assert!(last_user(&m.requests[0]).ends_with("Do not call tools.\nFocus: parser"));
+        assert_eq!(stages(&session.events), [2]);
+        assert_eq!(session.events.len(), 4); // SessionStart, the seeded turn, the compaction
+    }
+
+    #[test]
+    fn overflow_compacts_and_retries_once() {
+        let overflow = || Err(LlmError::ContextOverflow("prompt too long".into()));
+        let mut m = Scripted::new(vec![overflow(), text("SUM"), text("ok")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("overflow", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        seed_earlier_turn(&mut a);
+        assert_eq!(a.run_request("go"), Outcome::Done);
+        let session = a.session;
+
+        assert_eq!(m.requests.len(), 3);
+        // the trace records why it compacted
+        assert_eq!(errors(&session.events, "llm"), [("context window exceeded: prompt too long".to_string(), true)]);
+        assert_eq!(stages(&session.events), [2]);
+        // the summary call: the view ends with the request, so the prompt joins it rather than adding a second user message
+        assert_eq!(m.requests[1].1, 0);
+        assert_eq!(last_user(&m.requests[1]), format!("go\n\n{}", policy::summary_prompt(None)));
+        // the retry starts from the summary (the cut fell just before "go", which merges into it)
+        let retry = &m.requests[2].0;
+        assert!(matches!(&retry[..], [Message::System(_), Message::User(u)] if u.starts_with("[Session summary") && u.ends_with("\n\ngo")), "{retry:?}");
+
+        // only once: a second overflow ends the request
+        let mut m = Scripted::new(vec![overflow(), text("SUM"), overflow(), text("never")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("overflow2", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        seed_earlier_turn(&mut a);
+        assert_eq!(a.run_request("go"), Outcome::Error("context window exceeded: prompt too long".into()));
+        let session = a.session;
+
+        assert_eq!(m.requests.len(), 3);
+        assert_eq!(stages(&session.events), [2]);
+        let e = errors(&session.events, "llm");
+        assert_eq!(e.iter().map(|(_, retry)| *retry).collect::<Vec<_>>(), [true, false]);
+    }
+
+    #[test]
+    fn summary_failure_leaves_view() {
+        // one read whose reply reports 2_600 of 3_000 tokens (≥ 85%) triggers stage 2; each way the summary can fail
+        let interrupted = Ok(Reply { text: "partial".into(), interrupted: true, ..Default::default() });
+        let cases = [
+            ("sumnet", Err(LlmError::Network("reset".into())), "compaction failed: network error: reset"),
+            ("sumint", interrupted, "compaction failed: interrupted"),
+            ("sumempty", text("  "), "compaction failed: empty summary"),
+            ("sumwrite", text("SUM"), "compaction failed: cannot write summary: "),
+        ];
+        for (tag, summary_reply, want) in cases {
+            let mut m = Scripted::new(vec![read_f(1, 2_600), summary_reply, text("done")]);
+            let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+            let mut a = agent(tag, Mode::Writes, false, &mut m, &mut ui, &cancel);
+            a.budget = 3_000;
+            write_files(&a.tools.root, 1, "x");
+            if tag == "sumwrite" {
+                fs::remove_dir_all(a.session.dir.join("summaries")).unwrap();
+            }
+            assert_eq!(a.run_request("go"), Outcome::Done, "{tag}: the loop goes on");
+            let session = a.session;
+
+            assert_eq!(m.requests.len(), 3, "{tag}");
+            assert_eq!(m.requests[1].1, 0, "{tag}: the summary call");
+            let e = errors(&session.events, "compaction");
+            assert_eq!(e.len(), 1, "{tag}");
+            assert!(e[0].0.starts_with(want) && !e[0].1, "{tag}: {e:?}");
+            assert_eq!(ui.notices, [e[0].0.clone()], "{tag}");
+            assert!(compactions(&session.events).is_empty(), "{tag}");
+            // the view is unchanged: the next request is the history as it was, with no summary
+            assert_eq!(m.requests[2].0[..2], m.requests[0].0[..], "{tag}");
+            assert_eq!(m.requests[2].0.len(), 4, "{tag}: system, user, the read and its result");
+            assert_eq!(ui.text, "done", "{tag}: nothing of the summary call is streamed");
+        }
+    }
+
+    #[test]
+    fn single_long_request_compacts_mid_turn() {
+        // 30 reads of distinct 3_000-byte files, budget 30_000. Reply k reports 1_000·k tokens: stage 1 at reply 17 (≥ 60%),
+        // stage 2 at reply 18 (still ≥ 60% right after stage 1); the 19th reply is the summary, and every later one reports 5_000.
+        let mut script: Vec<_> = (1..=18).map(|i| read_f(i, 1_000 * i as u64)).collect();
+        script.push(text("SUM"));
+        script.extend((19..=30).map(|i| read_f(i, 5_000)));
+        script.push(text("done"));
+        let mut m = Scripted::new(script);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("midturn", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        a.budget = 30_000;
+        write_files(&a.tools.root, 30, &format!("{}\n", "y".repeat(99)).repeat(30));
+        assert_eq!(a.run_request("read all thirty files"), Outcome::Done);
+        let session = a.session;
+
+        assert_eq!(m.requests.len(), 32);
+        assert_eq!(stages(&session.events), [1, 2]);
+        let c = compactions(&session.events)[1];
+        let Kind::Compaction { from_seq: Some(1), to_seq: Some(to), summary: Some(summary), .. } = &c.kind else { panic!("{c:?}") };
+        assert!(summary.ends_with("\n\n## Current request (verbatim)\nread all thirty files"), "{summary}");
+        // the cut falls inside the request, just before an assistant event
+        assert!(matches!(session.events[*to as usize].kind, Kind::Assistant { .. }));
+        assert_eq!(m.requests[18].1, 0); // the summary call
+        let next = &m.requests[19].0;
+        assert_eq!(next[1], Message::User(summary.clone()));
+        assert!(matches!(next[2], Message::Assistant { .. }), "{:?}", next[2]);
+    }
+
+    #[test]
+    fn nothing_to_compact_is_a_notice() {
+        let mut m = Scripted::new(vec![]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("nothing", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        assert_eq!(a.compact(None), Ok(()));
+        let session = a.session;
+
+        assert_eq!(ui.notices, ["nothing to compact"]);
+        assert_eq!(session.events.len(), 1);
+        assert!(ui.events.is_empty() && m.requests.is_empty());
     }
 }
