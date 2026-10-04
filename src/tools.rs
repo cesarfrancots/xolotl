@@ -1,16 +1,30 @@
-//! File tools `read`, `write`, `edit` (spec §7, §7.1) and the char-boundary-safe `clip` helpers.
+//! File tools `read`, `write`, `edit` (spec §7, §7.1), shell selection and the `bash` tool (§7.2), and the
+//! char-boundary-safe `clip` helpers.
 
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_READ_LINES: usize = 2000;
 const MAX_LINE_BYTES: usize = 2000;
 const BINARY_SNIFF_BYTES: usize = 8192;
 
+/// How often `exec_shell` checks the child, the cancel flag and the deadline.
+const POLL: Duration = Duration::from_millis(50);
+/// After the child exits or is killed, how long to wait for its output pipes to close (a background process
+/// may hold them open for much longer).
+const DRAIN: Duration = Duration::from_secs(2);
+/// Captured output is capped so a runaway command (`yes`) cannot exhaust memory.
+const MAX_CAPTURE: usize = 32 << 20;
+
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Shell {
     Bash(PathBuf),
@@ -284,6 +298,223 @@ fn edit_impl(ctx: &mut ToolCtx, call_id: &str, args: &Value) -> Result<String, S
     Ok(format!("edited {path} (+{} −{}){note}", new.lines().count() * count, old.lines().count() * count))
 }
 
+// ---- shell (spec §7.2) ----
+
+/// Windows: Git Bash (`<git>\..\..\bin\bash.exe`, then `extra` in order; never the WSL launcher at
+/// `System32\bash.exe`), else PowerShell. Elsewhere: `bash` if it is installed, else `sh`.
+pub fn resolve_shell_from(windows: bool, git_exe: Option<&Path>, extra: &[PathBuf], exists: &dyn Fn(&Path) -> bool) -> Shell {
+    if !windows {
+        let has_bash = ["/bin/bash", "/usr/bin/bash"].iter().any(|p| exists(Path::new(p)));
+        return if has_bash { Shell::Bash(PathBuf::from("bash")) } else { Shell::Sh };
+    }
+    let from_git = git_exe.and_then(Path::parent).and_then(Path::parent).map(|root| root.join("bin").join("bash.exe"));
+    from_git.iter().chain(extra).find(|p| exists(p) && !is_wsl_launcher(p)).map_or(Shell::PowerShell, |p| Shell::Bash(p.clone()))
+}
+
+fn is_wsl_launcher(p: &Path) -> bool {
+    p.to_string_lossy().replace('/', "\\").to_lowercase().ends_with(r"\system32\bash.exe")
+}
+
+pub fn resolve_shell() -> Shell {
+    let git = if cfg!(windows) { where_git() } else { None };
+    let mut extra = vec![PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"), PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe")];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        extra.push(PathBuf::from(local).join(r"Programs\Git\bin\bash.exe"));
+    }
+    resolve_shell_from(cfg!(windows), git.as_deref(), &extra, &|p| p.is_file())
+}
+
+/// First line of `where git`.
+fn where_git() -> Option<PathBuf> {
+    let out = Command::new("where").arg("git").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let line = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    (!line.is_empty()).then(|| PathBuf::from(line))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Exec {
+    /// Combined stdout and stderr, in arrival order.
+    pub output: String,
+    /// `None` when the process was killed (timeout, cancel), died on a signal, or never started.
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub duration_ms: u64,
+}
+
+fn shell_command(shell: &Shell, cmd: &str) -> Command {
+    match shell {
+        Shell::Bash(path) => bash_command(path, cmd),
+        Shell::Sh => {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd]);
+            c
+        }
+        Shell::PowerShell => {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", cmd]);
+            c
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn bash_command(path: &Path, cmd: &str) -> Command {
+    let mut c = Command::new(path);
+    c.args(["-lc", cmd]);
+    c
+}
+
+/// Git Bash's runtime (msys) splits its command line differently from the Windows rules `Command::arg` quotes
+/// for: anywhere in an argument, a backslash before a backslash or a double quote is an escape. `echo 'a\\b'`
+/// would reach bash as `echo 'a\b'`. So the command is quoted by hand, escaping every backslash and quote.
+#[cfg(windows)]
+fn bash_command(path: &Path, cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new(path);
+    let quoted = format!("\"{}\"", cmd.replace('\\', r"\\").replace('"', r#"\""#));
+    c.arg("-c").raw_arg(quoted).env("CHERE_INVOKING", "1"); // CHERE_INVOKING: stay in the inherited cwd
+    c
+}
+
+/// Forwards everything `pipe` yields to `tx` as byte chunks; `tx` is dropped when the pipe closes.
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>, tx: mpsc::Sender<Vec<u8>>) {
+    let Some(mut pipe) = pipe else { return };
+    thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break; // exec_shell has returned
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Appends `chunk` to `out` up to `MAX_CAPTURE` bytes in total, noting in `truncated` that the rest was dropped.
+fn keep(out: &mut Vec<u8>, truncated: &mut bool, chunk: &[u8]) {
+    let room = MAX_CAPTURE.saturating_sub(out.len());
+    *truncated |= chunk.len() > room;
+    out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+}
+
+/// Kills `child` and everything it started, then reaps it.
+fn kill_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    let mut killer = if cfg!(windows) {
+        let mut c = Command::new("taskkill");
+        c.args(["/T", "/F", "/PID", &pid]);
+        c
+    } else {
+        let mut c = Command::new("kill"); // the child leads its own process group (see `exec_shell`)
+        c.args(["-KILL", &format!("-{pid}")]);
+        c
+    };
+    let _ = killer.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = child.kill(); // fallback when the tool above is missing or refused: at least stop the shell itself
+    let _ = child.wait();
+}
+
+/// Runs `cmd` in a fresh `shell` process in `cwd` (stdin closed) until it exits, `timeout` passes, or `cancel`
+/// is set; the last two kill the whole process tree and keep the partial output.
+pub fn exec_shell(shell: &Shell, cmd: &str, cwd: &Path, timeout: Duration, cancel: &AtomicBool) -> Exec {
+    let start = Instant::now();
+    let elapsed_ms = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut command = shell_command(shell, cmd);
+    command
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let output = format!("failed to start {}: {e}", command.get_program().to_string_lossy());
+            return Exec { output, exit_code: None, timed_out: false, cancelled: false, duration_ms: elapsed_ms() };
+        }
+    };
+
+    let (tx, rx) = mpsc::channel();
+    spawn_reader(child.stdout.take(), tx.clone());
+    spawn_reader(child.stderr.take(), tx); // `rx` disconnects once both readers are done
+
+    let deadline = start + timeout;
+    let (mut out, mut truncated) = (Vec::new(), false);
+    let mut readers_open = true;
+    let (mut timed_out, mut cancelled) = (false, false);
+    let status = loop {
+        if readers_open {
+            match rx.recv_timeout(POLL) {
+                Ok(chunk) => keep(&mut out, &mut truncated, &chunk),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => readers_open = false,
+            }
+        } else {
+            thread::sleep(POLL);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if cancel.load(Ordering::SeqCst) => cancelled = true,
+            Ok(None) if Instant::now() >= deadline => timed_out = true,
+            Ok(None) => continue,
+            Err(_) => {} // cannot observe the child any more: kill it rather than wait forever
+        }
+        kill_tree(&mut child);
+        break None;
+    };
+
+    // Collect what the readers still hold, but never wait for them past DRAIN and never join them: a
+    // background process may keep the pipes open for as long as it lives.
+    if readers_open {
+        let end = Instant::now() + DRAIN;
+        while let Some(left) = end.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(chunk) => keep(&mut out, &mut truncated, &chunk),
+                Err(_) => break,
+            }
+        }
+    }
+    let mut output = String::from_utf8_lossy(&out).into_owned();
+    if truncated {
+        // ponytail: keeps only the head of a runaway output. Upgrade path: spill the rest to a file.
+        output += &format!("\n[output limit reached: {MAX_CAPTURE} bytes kept, the rest was discarded]");
+    }
+    Exec { output, exit_code: status.and_then(|s| s.code()), timed_out, cancelled, duration_ms: elapsed_ms() }
+}
+
+/// `timeout` seconds, default 120, clamped to 1..=600 (fractions are dropped).
+pub(crate) fn bash_timeout(args: &Value) -> Duration {
+    let secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(120.0);
+    Duration::from_secs(secs.clamp(1.0, 600.0) as u64)
+}
+
+pub(crate) fn bash(ctx: &mut ToolCtx, args: &Value, cancel: &AtomicBool) -> ToolOut {
+    let cmd = match str_arg(args, "command") {
+        Ok(cmd) => cmd,
+        Err(e) => return ToolOut::err(e),
+    };
+    let timeout = bash_timeout(args);
+    let e = exec_shell(&ctx.shell, cmd, &ctx.root, timeout, cancel);
+    let secs = e.duration_ms as f64 / 1000.0;
+    let footer = match e.exit_code {
+        _ if e.cancelled => "\n[cancelled by user]".to_string(),
+        _ if e.timed_out => format!("\n[timed out after {}s · partial output above]", timeout.as_secs()),
+        Some(code) => format!("\n[exit {code} · {secs:.1}s]"),
+        None => format!("\n[terminated without an exit code · {secs:.1}s]"),
+    };
+    ToolOut { ok: e.exit_code == Some(0), text: e.output + &footer, exit_code: e.exit_code, cancelled: e.cancelled }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +731,199 @@ mod tests {
         let o = ed(&mut c, "e2", "b.txt", "a\nb", "z");
         assert!(!o.ok && o.text.contains("lines 1, 3"), "{}", o.text);
         assert_eq!(gets(&c, "b.txt"), " a\n b\n a\n b\n");
+    }
+
+    // ---- shell (Task 5) ----
+
+    #[cfg(windows)]
+    #[test]
+    fn never_picks_wsl_launcher() {
+        let all = |_: &Path| true;
+        assert_eq!(
+            resolve_shell_from(true, Some(Path::new(r"C:\Program Files\Git\cmd\git.exe")), &[], &all),
+            Shell::Bash(PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"))
+        );
+        let only_wsl = |p: &Path| p.ends_with(r"System32\bash.exe");
+        assert_eq!(resolve_shell_from(true, None, &[PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")], &only_wsl), Shell::PowerShell);
+        // the WSL launcher is skipped even when it is the only candidate that exists, in any case or slash style
+        let wsl = |p: &Path| p.to_string_lossy().to_lowercase().contains("system32");
+        assert_eq!(resolve_shell_from(true, None, &[PathBuf::from(r"C:\WINDOWS/System32/bash.exe")], &wsl), Shell::PowerShell);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_tries_git_then_extras_in_order() {
+        let git = Path::new(r"C:\Git\cmd\git.exe");
+        let extra = [PathBuf::from(r"C:\A\bash.exe"), PathBuf::from(r"C:\B\bash.exe")];
+        let has = |want: &'static [&'static str]| move |p: &Path| want.iter().any(|w| p == Path::new(w));
+        let all = has(&[r"C:\Git\bin\bash.exe", r"C:\A\bash.exe", r"C:\B\bash.exe"]);
+        assert_eq!(resolve_shell_from(true, Some(git), &extra, &all), Shell::Bash(PathBuf::from(r"C:\Git\bin\bash.exe")));
+        let no_git = has(&[r"C:\A\bash.exe", r"C:\B\bash.exe"]);
+        assert_eq!(resolve_shell_from(true, Some(git), &extra, &no_git), Shell::Bash(PathBuf::from(r"C:\A\bash.exe")));
+        let last = has(&[r"C:\B\bash.exe"]);
+        assert_eq!(resolve_shell_from(true, Some(git), &extra, &last), Shell::Bash(PathBuf::from(r"C:\B\bash.exe")));
+        assert_eq!(resolve_shell_from(true, None, &[], &|_| true), Shell::PowerShell);
+    }
+
+    #[test]
+    fn non_windows_prefers_bash_then_sh() {
+        assert_eq!(resolve_shell_from(false, None, &[], &|p| p == Path::new("/bin/bash")), Shell::Bash(PathBuf::from("bash")));
+        assert_eq!(resolve_shell_from(false, None, &[], &|p| p == Path::new("/usr/bin/bash")), Shell::Bash(PathBuf::from("bash")));
+        assert_eq!(resolve_shell_from(false, None, &[], &|_| false), Shell::Sh);
+    }
+
+    #[test]
+    fn bash_timeout_defaults_and_clamps() {
+        assert_eq!(bash_timeout(&json!({})), Duration::from_secs(120));
+        assert_eq!(bash_timeout(&json!({"timeout": 9999})), Duration::from_secs(600));
+        assert_eq!(bash_timeout(&json!({"timeout": 5})), Duration::from_secs(5));
+        assert_eq!(bash_timeout(&json!({"timeout": 0})), Duration::from_secs(1));
+        assert_eq!(bash_timeout(&json!({"timeout": -3})), Duration::from_secs(1));
+        assert_eq!(bash_timeout(&json!({"timeout": 2.5})), Duration::from_secs(2));
+        assert_eq!(bash_timeout(&json!({"timeout": "soon"})), Duration::from_secs(120));
+    }
+
+    // The tests below return early unless resolve_shell() is Shell::Bash.
+    fn git_bash() -> Option<Shell> {
+        Some(resolve_shell()).filter(|s| matches!(s, Shell::Bash(_)))
+    }
+    fn run_in(sh: &Shell, dir: &Path, cmd: &str, secs: u64) -> Exec {
+        exec_shell(sh, cmd, dir, Duration::from_secs(secs), &AtomicBool::new(false))
+    }
+    fn run(sh: &Shell, cmd: &str, secs: u64) -> Exec {
+        run_in(sh, &test_dir("exec"), cmd, secs)
+    }
+
+    #[test]
+    fn exec_captures_output_and_exit() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, "echo hi; echo err >&2; exit 3", 10);
+        assert!(e.output.contains("hi") && e.output.contains("err"), "{:?}", e.output);
+        assert_eq!(e.exit_code, Some(3));
+        assert!(!e.timed_out && !e.cancelled);
+    }
+
+    #[test]
+    fn exec_times_out_and_kills_tree() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, "echo before; sleep 30", 1);
+        assert!(e.timed_out && !e.cancelled, "{e:?}");
+        assert_eq!(e.exit_code, None);
+        assert!(e.output.contains("before"), "partial output is kept: {:?}", e.output);
+        assert!(e.duration_ms >= 1000 && e.duration_ms < 5000, "{}", e.duration_ms);
+    }
+
+    #[test]
+    fn exec_cancel() {
+        let Some(sh) = git_bash() else { return };
+        let dir = test_dir("exec-cancel");
+        let cancel = AtomicBool::new(false);
+        let e = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                cancel.store(true, Ordering::SeqCst);
+            });
+            exec_shell(&sh, "sleep 30", &dir, Duration::from_secs(20), &cancel)
+        });
+        assert!(e.cancelled && !e.timed_out, "{e:?}");
+        assert_eq!(e.exit_code, None);
+        assert!(e.duration_ms < 5000, "{}", e.duration_ms);
+    }
+
+    #[test]
+    fn stdin_is_closed() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, "cat", 10);
+        assert_eq!(e.exit_code, Some(0), "{e:?}");
+        assert!(!e.timed_out && e.duration_ms < 5000, "{e:?}");
+    }
+
+    #[test]
+    fn background_process_does_not_hang() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, "sleep 20 & echo started", 30);
+        assert!(e.duration_ms < 5000, "{}", e.duration_ms);
+        assert!(e.output.contains("started"), "{:?}", e.output);
+        assert_eq!(e.exit_code, Some(0));
+    }
+
+    #[test]
+    fn runs_in_root_with_spaces() {
+        let Some(sh) = git_bash() else { return };
+        let dir = test_dir("exec-space").join("with space");
+        fs::create_dir_all(&dir).unwrap();
+        let e = run_in(&sh, &dir, "pwd", 10);
+        assert!(e.output.contains("with space"), "{:?}", e.output);
+        assert_eq!(e.exit_code, Some(0));
+    }
+
+    #[test]
+    fn exec_passes_quotes_and_newlines_intact() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, "echo \"a b\" 'c  d'\nx=1\necho \"x=$x\" back\\\\slash", 10);
+        assert_eq!(e.output.replace("\r\n", "\n"), "a b c  d\nx=1 back\\slash\n", "{:?}", e.output);
+    }
+
+    /// On Windows the command crosses a command line: backslash runs and quotes must reach bash unchanged.
+    #[test]
+    fn exec_passes_backslashes_and_quotes_through_unchanged() {
+        let Some(sh) = git_bash() else { return };
+        let dir = test_dir("exec-bs");
+        for text in [r"a\\b", r"a\\\b", r"\\\\", r"trail\\", r"trail\", r#"x\"y"#, r#"x\\"y"#, r#"q"q"#, r"it's `x` $HOME", "tab\\t nl\\n", "two\nlines  gap\n\n"] {
+            let e = run_in(&sh, &dir, &format!("cat <<'XOLOTL_EOF'\n{text}\nXOLOTL_EOF"), 10);
+            assert_eq!(e.output, format!("{text}\n"), "text {text:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_fallback_runs() {
+        let e = run(&Shell::PowerShell, "Write-Output 'a b'; exit 4", 30);
+        assert!(e.output.contains("a b"), "{:?}", e.output);
+        assert_eq!(e.exit_code, Some(4));
+    }
+
+    #[test]
+    fn exec_keeps_only_the_first_capture_limit_of_runaway_output() {
+        let Some(sh) = git_bash() else { return };
+        let e = run(&sh, &format!("head -c {} /dev/zero | tr '\\0' x", MAX_CAPTURE + 5_000_000), 30);
+        assert_eq!(e.exit_code, Some(0), "{:?}", clip(&e.output, 200));
+        assert!(e.output.starts_with("xxxx") && e.output.len() > MAX_CAPTURE, "{}", e.output.len());
+        assert!(e.output.ends_with("discarded]"), "{:?}", clip_tail(&e.output, 100));
+        assert!(e.output.len() < MAX_CAPTURE + 200, "{}", e.output.len());
+    }
+
+    #[test]
+    fn bash_tool_footer() {
+        let Some(shell) = git_bash() else { return };
+        let mut c = ctx("bash-tool");
+        c.shell = shell;
+        let o = bash(&mut c, &json!({ "command": "echo hi" }), &AtomicBool::new(false));
+        assert!(o.ok && o.exit_code == Some(0) && !o.cancelled, "{o:?}");
+        assert!(o.text.starts_with("hi"), "{:?}", o.text);
+        let footer = o.text.rsplit('\n').next().unwrap();
+        let secs = footer.strip_prefix("[exit 0 · ").and_then(|f| f.strip_suffix("s]")).unwrap_or_else(|| panic!("{footer:?}"));
+        assert!(secs.parse::<f64>().is_ok() && secs.split('.').nth(1).map(str::len) == Some(1), "{secs:?}");
+
+        let o = bash(&mut c, &json!({ "command": "exit 2" }), &AtomicBool::new(false));
+        assert!(!o.ok && o.exit_code == Some(2), "{o:?}");
+        assert!(o.text.contains("[exit 2 · "), "{:?}", o.text);
+
+        let o = bash(&mut c, &json!({ "command": "sleep 5", "timeout": 1 }), &AtomicBool::new(false));
+        assert!(!o.ok && !o.cancelled && o.exit_code.is_none(), "{o:?}");
+        assert!(o.text.contains("[timed out after 1s · partial output above]"), "{:?}", o.text);
+    }
+
+    #[test]
+    fn bash_tool_cancel_and_bad_args() {
+        let Some(shell) = git_bash() else { return };
+        let mut c = ctx("bash-tool-cancel");
+        c.shell = shell;
+        let o = bash(&mut c, &json!({ "command": "sleep 30" }), &AtomicBool::new(true));
+        assert!(!o.ok && o.cancelled, "{o:?}");
+        assert!(o.text.ends_with("\n[cancelled by user]"), "{:?}", o.text);
+
+        assert_eq!(bash(&mut c, &json!({}), &AtomicBool::new(false)).text, "missing argument `command`");
+        assert!(!bash(&mut c, &json!({ "command": 7 }), &AtomicBool::new(false)).ok);
     }
 }
