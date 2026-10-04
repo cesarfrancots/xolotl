@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod agent;
 mod llm;
 mod perms;
 mod policy;
