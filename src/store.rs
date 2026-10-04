@@ -170,6 +170,7 @@ impl Session {
         Ok(n)
     }
 
+    #[allow(dead_code)] // only the tests use it in v1
     pub fn events_path(&self) -> PathBuf {
         self.dir.join("events.jsonl")
     }
@@ -201,6 +202,13 @@ impl Session {
         self.append(Kind::SessionEnd { status: status.into() })?;
         self.meta.ended_ms = Some(now_ms());
         self.meta.status = status.into();
+        self.write_meta()
+    }
+
+    /// Marks a resumed session as running again, so a crash after resume doesn't leave it reading as finished.
+    pub fn reopen(&mut self) -> io::Result<()> {
+        self.meta.ended_ms = None;
+        self.meta.status = "running".into();
         self.write_meta()
     }
 
@@ -463,6 +471,17 @@ mod tests {
         let reopened = Session::open(&s.dir).unwrap();
         assert_eq!(reopened.meta, s.meta);
         assert_eq!(reopened.events, s.events);
+    }
+
+    #[test]
+    fn reopen_marks_a_finished_session_running() {
+        let root = test_dir("reopen");
+        let mut s = Session::create(&root, meta("20250101-000000-0001")).unwrap();
+        s.finish("done").unwrap();
+        let mut s = Session::open(&s.dir).unwrap();
+        s.reopen().unwrap();
+        assert_eq!((s.meta.status.as_str(), s.meta.ended_ms), ("running", None));
+        assert_eq!(Session::open(&s.dir).unwrap().meta, s.meta);
     }
 
     #[test]

@@ -85,8 +85,10 @@ pub trait Model {
 }
 
 /// Replays canned replies in order and records each request as `(messages, tool count)`.
+#[allow(dead_code)] // test double: only the tests use it
 pub struct Scripted { replies: VecDeque<Result<Reply, LlmError>>, pub requests: Vec<(Vec<Message>, usize)> }
 
+#[allow(dead_code)] // test double: only the tests use it
 impl Scripted {
     pub fn new(replies: Vec<Result<Reply, LlmError>>) -> Self {
         Scripted { replies: replies.into(), requests: Vec::new() }
