@@ -1,0 +1,11 @@
+{
+  "id": "py-perf",
+  "title": "Make an O(n^2) function fast",
+  "tags": ["python", "performance"],
+  "prompt": "dedupe() in fast.py is too slow for large inputs: it must handle 200,000 items in well under 2 seconds. Make it fast without changing its behavior.",
+  "verify": ["{python} -m unittest discover -s verify -v"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}

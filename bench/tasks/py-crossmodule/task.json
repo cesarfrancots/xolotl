@@ -1,0 +1,11 @@
+{
+  "id": "py-crossmodule",
+  "title": "Fix a bug that lives in another module",
+  "tags": ["python", "bugfix"],
+  "prompt": "tests/test_orders.py fails. Fix the underlying bug without changing the tests.",
+  "verify": ["{python} -m unittest discover -s verify -v"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}
