@@ -35,7 +35,7 @@ use ui::{Headless, Status, Terminal, status_line};
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str =
-    "usage: xolotl [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>]";
+    "usage: xolotl [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>] [--version]";
 /// The `reasoning_effort` values the API documents. It silently accepts any other value (docs/glm-api-notes.md #5).
 const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const SLASH_COMMANDS: [&str; 8] = ["/help", "/mode", "/compact", "/clear", "/resume", "/think", "/status", "/exit"];
@@ -63,6 +63,7 @@ struct Args {
     budget: Option<usize>,
     allow: Vec<String>,
     model: Option<String>,
+    version: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -80,6 +81,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--allow" => a.allow.push(value()?),
             "--model" => a.model = Some(value()?),
+            "--version" => a.version = true,
             "--resume" => a.resume = Some(it.next_if(|t| !t.starts_with('-')).cloned()),
             _ => return Err(format!("unknown flag {flag}")),
         }
@@ -245,6 +247,10 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, String> {
     let args = parse_args(&env::args().skip(1).collect::<Vec<_>>()).map_err(|e| format!("{e}\n{USAGE}"))?;
+    if args.version {
+        println!("xolotl {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
     let root = env::home_dir().ok_or("cannot find the home directory")?.join(".xolotl");
     let (cfg, mode) = apply(load_config(&root.join("config.json"))?, &args)?;
     let api_key = api_key(&cfg.api_key_env).ok_or_else(|| format!("set {} to your Z.ai API key", cfg.api_key_env))?;
@@ -624,6 +630,15 @@ mod tests {
         assert!(parse_args(&strs(&["--budget", "abc"])).is_err());
         assert!(parse_args(&strs(&["-p"])).is_err());
         assert!(parse_args(&strs(&["--allow"])).is_err());
+    }
+
+    #[test]
+    fn args_version_flag() {
+        assert!(!Args::default().version);
+        assert!(parse_args(&strs(&["--version"])).unwrap().version);
+        // it can sit anywhere and needs no value
+        assert!(parse_args(&strs(&["--mode", "ask", "--version", "-p", "x"])).unwrap().version);
+        assert_eq!(parse_args(&strs(&["--version"])).unwrap(), Args { version: true, ..Args::default() });
     }
 
     #[test]
