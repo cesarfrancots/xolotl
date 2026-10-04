@@ -1,0 +1,11 @@
+{
+  "id": "fx-ok",
+  "title": "Fixture: write 42 to answer.txt",
+  "tags": ["fixture"],
+  "prompt": "ok",
+  "verify": ["{python} verify/check.py"],
+  "timeout_s": 30,
+  "verify_timeout_s": 30,
+  "budget": null,
+  "requires": []
+}
