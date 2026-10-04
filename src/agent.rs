@@ -71,7 +71,7 @@ impl Agent<'_> {
     /// the view unchanged; its message comes back for the caller to show.
     pub fn compact(&mut self, focus: Option<&str>) -> Result<(), String> {
         self.cancel.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
-        match self.stage2(focus) {
+        match self.stage2(focus, false) {
             Ok(result) => result,
             Err(Outcome::Error(fatal)) => Err(fatal),
             Err(other) => unreachable!("a failed session write is always Outcome::Error, got {other:?}"),
@@ -99,7 +99,7 @@ impl Agent<'_> {
                 self.ui.notice(&format!("compacted: elided old tool output (≤ seq {upto_seq})"));
             }
             Some(Compaction::Stage2) => {
-                if let Err(e) = self.stage2(None)? {
+                if let Err(e) = self.stage2(None, false)? {
                     *stage2_failed = true;
                     self.ui.notice(&e); // the loop goes on with the view unchanged
                 }
@@ -109,15 +109,16 @@ impl Agent<'_> {
     }
 
     /// Stage 2 (spec §10.4). `Ok(Err(msg))`: the compaction failed; it is recorded as an `error` event and the view is
-    /// unchanged. `Err`: a failed session write, as with `append`.
-    fn stage2(&mut self, focus: Option<&str>) -> Result<Result<(), String>, Outcome> {
+    /// unchanged. `Err`: a failed session write, as with `append`. `overflowed`: the API rejected the current view as too
+    /// long, so the summary call sends it with every tool result stubbed.
+    fn stage2(&mut self, focus: Option<&str>, overflowed: bool) -> Result<Result<(), String>, Outcome> {
         let events = &self.session.events;
         let Some(cut) = policy::stage2_cut(events, self.budget) else {
             self.ui.notice("nothing to compact");
             return Ok(Ok(()));
         };
         let tokens_before = policy::estimate_tokens(events) as u64;
-        let mut view = policy::build_view(events);
+        let mut view = if overflowed { policy::stubbed_view(events) } else { policy::build_view(events) };
         let prompt = policy::summary_prompt(focus);
         match view.last_mut() {
             // the view never holds two user messages in a row
@@ -127,6 +128,7 @@ impl Agent<'_> {
             }
             _ => view.push(Message::User(prompt)),
         }
+        self.ui.notice(&format!("compacting… (summarizing events {}–{})", cut.from_seq, cut.to_seq));
         // Tools disabled: the API accepts a history with tool calls without them (spec §16 item 8). The summary is not an
         // answer, so only notices reach the Ui.
         let ui = &mut *self.ui;
@@ -215,7 +217,7 @@ impl Agent<'_> {
                     overflow_retried = true;
                     // the trace records why the history is compacted; then the request is retried once
                     self.append(Kind::Error { kind: "llm".into(), message: e.to_string(), retry: true })?;
-                    if let Err(e) = self.stage2(None)? {
+                    if let Err(e) = self.stage2(None, true)? {
                         self.ui.notice(&e);
                         return Ok(Outcome::Error(e));
                     }
@@ -1105,6 +1107,39 @@ mod tests {
     }
 
     #[test]
+    fn overflow_summary_is_sent_with_results_stubbed() {
+        let mut m = Scripted::new(vec![Err(LlmError::ContextOverflow("prompt too long".into())), text("SUM"), text("ok")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("overflowstub", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        // an earlier turn whose tool result is big (seq 2..=5)
+        let reply = |text: &str, tool_calls: Vec<ToolCall>| Kind::Assistant {
+            text: text.into(),
+            reasoning: String::new(),
+            tool_calls,
+            usage: Usage::default(),
+            finish_reason: "stop".into(),
+            latency_ms: 0,
+        };
+        let big = "r".repeat(5_000);
+        a.session.append(Kind::User { text: "earlier".into() }).unwrap();
+        a.session.append(reply("", vec![tc("c0", "bash", "{}")])).unwrap();
+        let output = Kind::ToolResult { call_id: "c0".into(), name: "bash".into(), ok: true, output: big.clone(), artifact: None, bytes: 5_000, duration_ms: 0, exit_code: Some(0) };
+        a.session.append(output).unwrap();
+        a.session.append(reply("ok", vec![])).unwrap();
+        assert_eq!(a.run_request("go"), Outcome::Done);
+
+        let tool_texts = |r: &(Vec<Message>, usize)| -> Vec<String> {
+            r.0.iter().filter_map(|m| if let Message::Tool { content, .. } = m { Some(content.clone()) } else { None }).collect()
+        };
+        assert_eq!(tool_texts(&m.requests[0]), [big]); // the call that overflowed
+        // the summary call after the overflow: the same history, with the result stubbed
+        assert_eq!(m.requests[1].1, 0);
+        assert_eq!(tool_texts(&m.requests[1]), ["[elided: 5KB bash output — events.jsonl seq 4]"]);
+        assert_eq!(m.requests[1].0[0], Message::System("S".into()));
+        assert_eq!(last_user(&m.requests[1]), format!("go\n\n{}", policy::summary_prompt(None)));
+    }
+
+    #[test]
     fn summary_failure_leaves_view() {
         // one read whose reply reports 2_600 of 3_000 tokens (≥ 85%) triggers stage 2; each way the summary can fail
         let interrupted = Ok(Reply { text: "partial".into(), interrupted: true, ..Default::default() });
@@ -1131,7 +1166,7 @@ mod tests {
             let e = errors(&session.events, "compaction");
             assert_eq!(e.len(), 1, "{tag}");
             assert!(e[0].0.starts_with(want) && !e[0].1, "{tag}: {e:?}");
-            assert_eq!(ui.notices, [e[0].0.clone()], "{tag}");
+            assert_eq!(ui.notices, ["compacting… (summarizing events 1–2)".to_string(), e[0].0.clone()], "{tag}");
             assert!(compactions(&session.events).is_empty(), "{tag}");
             // the view is unchanged: the next request is the history as it was, with no summary
             assert_eq!(m.requests[2].0[..2], m.requests[0].0[..], "{tag}");
@@ -1236,7 +1271,8 @@ mod tests {
         assert_eq!(m.requests.len(), 5); // read, failed summary, read, read, answer
         assert_eq!(summary_calls(&m), 1);
         assert_eq!(errors(&session.events, "compaction").len(), 1);
-        assert_eq!(ui.notices, ["compaction failed: network error: reset"]);
+        // the summary call is announced with its range before it starts (a mid-turn cut: events 1–2 of the request)
+        assert_eq!(ui.notices, ["compacting… (summarizing events 1–2)", "compaction failed: network error: reset"]);
         assert!(stages(&session.events).is_empty());
 
         // the latch is per request

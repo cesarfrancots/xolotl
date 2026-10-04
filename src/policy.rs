@@ -1,7 +1,7 @@
 //! Everything the model sees: system prompt, environment snapshot, output caps, and the message view built from
 //! the on-disk events. Pure functions only (no I/O). Signatures follow spec §5.1 so a v2 optimizer can rewrite this file.
 
-use crate::llm::Message;
+use crate::llm::{Message, ToolCall};
 use crate::store::{Event, Kind};
 use crate::tools::{Shell, clip, clip_tail};
 use serde_json::Value;
@@ -146,6 +146,17 @@ pub fn cap_output(tool: &str, output: &str) -> Capped {
 /// Messages for every model call: system prompt, the latest stage-2 summary (if any), then the events after that
 /// summary's range, with stage-1 stubs applied.
 pub fn build_view(events: &[Event]) -> Vec<Message> {
+    view(events, None)
+}
+
+/// `build_view` with every tool result (except `todo`) stubbed: what the summary call sends after a context overflow,
+/// since the full view is what overflowed.
+pub fn stubbed_view(events: &[Event]) -> Vec<Message> {
+    view(events, Some(events.last().map_or(0, |e| e.seq)))
+}
+
+/// `stub_upto`: `None` applies the stage-1 cutoff in force.
+fn view(events: &[Event], stub_upto: Option<u64>) -> Vec<Message> {
     let mut view = Vec::new();
     if let Some(system) = events.iter().find_map(|e| if let Kind::SessionStart { system, .. } = &e.kind { Some(system) } else { None }) {
         view.push(Message::System(system.clone()));
@@ -154,7 +165,7 @@ pub fn build_view(events: &[Event]) -> Vec<Message> {
         view.push(Message::User(summary.to_string()));
         to
     });
-    view.extend(render(events, after, stage1_upto(events, after)));
+    view.extend(render(events, after, stub_upto.unwrap_or_else(|| stage1_upto(events, after))));
     merge_users(view) // a cut before a user event leaves the summary next to a User: one turn, not two
 }
 
@@ -188,7 +199,11 @@ fn to_message(e: &Event, stub_upto: u64) -> Option<Message> {
         Kind::Assistant { text, reasoning, tool_calls, .. } => Message::Assistant {
             text: text.clone(),
             reasoning: (RESEND_REASONING && !reasoning.is_empty()).then(|| reasoning.clone()),
-            tool_calls: tool_calls.clone(),
+            // arguments that are not JSON are sent as `{}` (the call's result already says why it failed); the event keeps them
+            tool_calls: tool_calls
+                .iter()
+                .map(|c| if serde_json::from_str::<Value>(&c.args).is_ok() { c.clone() } else { ToolCall { args: "{}".into(), ..c.clone() } })
+                .collect(),
         },
         Kind::ToolResult { call_id, name, output, artifact, bytes, .. } => Message::Tool {
             call_id: call_id.clone(),
@@ -269,10 +284,11 @@ fn tokens_of(msgs: impl IntoIterator<Item = Message>) -> usize {
 }
 
 /// The last response's `prompt + completion` tokens plus `chars / 3` of what came after it. A compaction after that
-/// response makes its usage stale, so then it is `chars / 3` of the whole view.
+/// response makes its usage stale, so then it is `chars / 3` of the whole view. A response without usage (an
+/// interrupted one reports none) does not count as the last response.
 pub fn estimate_tokens(events: &[Event]) -> usize {
     let last_assistant = events.iter().enumerate().rev().find_map(|(i, e)| match &e.kind {
-        Kind::Assistant { usage, .. } => Some((i, usage)),
+        Kind::Assistant { usage, .. } if usage.prompt > 0 => Some((i, usage)),
         _ => None,
     });
     let last_compaction = events.iter().rposition(|e| matches!(e.kind, Kind::Compaction { .. }));
@@ -320,8 +336,8 @@ pub fn stage2_cut(events: &[Event], budget: usize) -> Option<Cut> {
     let users: Vec<u64> = events.iter().filter(|e| matches!(e.kind, Kind::User { .. })).map(|e| e.seq).collect();
     let n = users.len();
     // A: just before the second-to-last user event, B: just before the last one
-    let ab = [n.checked_sub(2), n.checked_sub(1)].into_iter().flatten().map(|i| users[i].saturating_sub(1));
-    if let Some(c) = ab.into_iter().find(|&c| valid(c) && fits(c, LIMITS.cut_keep_pct)) {
+    let ab: Vec<u64> = [n.checked_sub(2), n.checked_sub(1)].into_iter().flatten().map(|i| users[i].saturating_sub(1)).collect();
+    if let Some(&c) = ab.iter().find(|&&c| valid(c) && fits(c, LIMITS.cut_keep_pct)) {
         return Some(cut(c, false));
     }
     // C: mid-turn, just before an assistant event after the last user: the earliest that fits, else the last
@@ -332,8 +348,11 @@ pub fn stage2_cut(events: &[Event], budget: usize) -> Option<Cut> {
         .map(|e| e.seq.saturating_sub(1))
         .filter(|&c| valid(c))
         .collect();
-    let c = before_assistant.iter().copied().find(|&c| fits(c, LIMITS.cut_mid_pct)).or(before_assistant.last().copied())?;
-    Some(cut(c, true))
+    match before_assistant.iter().copied().find(|&c| fits(c, LIMITS.cut_mid_pct)).or(before_assistant.last().copied()) {
+        Some(c) => Some(cut(c, true)),
+        // no reply after the last user event (a big paste): the last valid A/B cut, though over 40%, still compacts the rest
+        None => ab.iter().rev().copied().find(|&c| valid(c)).map(|c| cut(c, false)),
+    }
 }
 
 pub fn summary_prompt(focus: Option<&str>) -> String {
@@ -345,7 +364,7 @@ pub fn summary_prompt(focus: Option<&str>) -> String {
 ## Files touched
 ## Failed attempts and why they failed
 ## Open TODOs and next step
-Be specific: file paths, function names, commands, exact error messages. Do not call tools.",
+Be specific: file paths, function names, commands, exact error messages. Do not write a table of contents; Xolotl appends one. Do not call tools.",
     );
     if let Some(f) = focus {
         p.push_str("\nFocus: ");
@@ -391,10 +410,11 @@ pub fn table_of_contents(events: &[Event], session_dir: &Path) -> String {
 pub fn summary_message(summary: &str, cut: &Cut, events: &[Event], session_dir: &Path) -> String {
     let covered = &events[..events.partition_point(|e| e.seq <= cut.to_seq)];
     let mut msg = format!(
-        "[Session summary — events {}–{} compacted. Raw history: {}/events.jsonl (line = seq); read/grep it for exact details.]\n\n{summary}\n\n{}",
+        "[Session summary — events {}–{} compacted. Raw history: {}/events.jsonl (line = seq); read/grep it for exact details.]\n\n{}\n\n{}",
         cut.from_seq,
         cut.to_seq,
         session_dir.display(),
+        without_toc(summary),
         table_of_contents(covered, session_dir)
     );
     // a mid-turn cut would otherwise leave the model without its task
@@ -405,6 +425,19 @@ pub fn summary_message(summary: &str, cut: &Cut, events: &[Event], session_dir: 
         msg.push_str(request);
     }
     msg
+}
+
+/// `summary` up to its first line that starts a `## Table of contents` (any case): a model that copies the previous
+/// summary's table would otherwise leave two, with stale seqs in one.
+fn without_toc(summary: &str) -> &str {
+    let mut at = 0;
+    for line in summary.split_inclusive('\n') {
+        if line.get(..20).is_some_and(|h| h.eq_ignore_ascii_case("## table of contents")) {
+            return summary[..at].trim_end();
+        }
+        at += line.len();
+    }
+    summary
 }
 
 /// Files a successful `edit`/`write` changed, in order of first change, with the seq of every change.
@@ -786,6 +819,23 @@ mod tests {
     }
 
     #[test]
+    fn estimate_skips_replies_without_usage() {
+        let head = || vec![session_start(&"s".repeat(60)), user(&"u".repeat(60))];
+        let call = || with_usage(asst_calls(&[("c1", "bash", "{}")]), 1000, 200);
+        let out = || result("c1", "bash", &"r".repeat(300));
+        let cut_off = "partial\n[interrupted]";
+
+        // an interrupted reply reports zero usage: the response before it still counts, plus chars/3 of all that came after it
+        let events = evs([head(), vec![call(), out(), asst(cut_off, "")]].concat());
+        assert_eq!(estimate_tokens(&events), 1000 + 200 + (300 + cut_off.len()) / 3);
+
+        // no response with usage at all: chars/3 of the view
+        let events = evs([head(), vec![asst(cut_off, "")]].concat());
+        assert_eq!(estimate_tokens(&events), tokens_of(build_view(&events)));
+        assert!(estimate_tokens(&events) > 0);
+    }
+
+    #[test]
     fn triggers() {
         let base = |n: usize| evs([vec![session_start("S"), user("go")], pairs("a", n, 10)].concat()); // results at seq 4, 6, 8, …
         let twelve = base(12);
@@ -910,6 +960,67 @@ mod tests {
         // a cut only has to be valid on its own: A (seq 1) is not, B (seq 2) is
         let two_users = evs(vec![session_start("S"), user("a"), user("b"), asst("c", "")]);
         assert_eq!(stage2_cut(&two_users, 100_000), Some(Cut { from_seq: 1, to_seq: 2, mid_turn: false }));
+    }
+
+    #[test]
+    fn stage2_cut_big_paste_falls_back_to_b() {
+        // an earlier turn, then a pasted request far over 40% of the budget and no reply yet: B (seq 3) is valid but too big to
+        // keep, and C has no assistant after the last user. B still compacts the earlier turn.
+        let events = evs(vec![session_start("S"), user("u1"), asst("a1", ""), user(&"p".repeat(3_000))]);
+        assert_eq!(stage2_cut(&events, 1_000), Some(Cut { from_seq: 1, to_seq: 3, mid_turn: false }));
+        // still nothing when no A/B cut is valid either
+        assert_eq!(stage2_cut(&evs(vec![session_start("S"), user(&"p".repeat(3_000))]), 1_000), None);
+    }
+
+    #[test]
+    fn summary_drops_a_model_written_toc() {
+        let events = evs(vec![session_start("S"), user("go"), asst("a", "")]);
+        let cut = Cut { from_seq: 1, to_seq: 3, mid_turn: false };
+        let dir = Path::new("/s");
+        // the model copied the previous summary's table of contents (stale seqs) into its own
+        let model = "## Goal\nfix it\n\n## table of contents (generated by Xolotl)\n- seq 99: stale\n\n### Todo\n(none)";
+        let msg = summary_message(model, &cut, &events, dir);
+        assert_eq!(msg.to_lowercase().matches("## table of contents").count(), 1, "{msg}");
+        assert!(msg.contains("## Goal\nfix it\n\n## Table of contents (generated by Xolotl)") && !msg.contains("seq 99"), "{msg}");
+        assert!(msg.ends_with(&table_of_contents(&events, dir)));
+        assert!(summary_prompt(None).contains("Do not write a table of contents; Xolotl appends one."));
+    }
+
+    #[test]
+    fn view_sends_invalid_args_as_an_empty_object() {
+        let events = vec![
+            ev(1, asst_calls(&[("c1", "read", "{bad"), ("c2", "read", r#"{"path":"a"}"#), ("c3", "read", "")])),
+            ev(2, result("c1", "read", "invalid JSON arguments")),
+            ev(3, result("c2", "read", "ok")),
+            ev(4, result("c3", "read", "invalid JSON arguments")),
+        ];
+        let Message::Assistant { tool_calls, .. } = &render(&events, 0, 0)[0] else { panic!() };
+        assert_eq!(tool_calls.iter().map(|c| c.args.as_str()).collect::<Vec<_>>(), ["{}", r#"{"path":"a"}"#, "{}"]);
+    }
+
+    #[test]
+    fn stubbed_view_stubs_every_result() {
+        let events = vec![
+            ev(1, session_start("S")),
+            ev(2, user("u1")),
+            ev(3, asst_calls(&[("c1", "bash", "{}")])),
+            ev(4, result("c1", "bash", "old")),
+            ev(5, compaction(2, None, Some(4), Some("SUM"))),
+            ev(6, user("u2")),
+            ev(7, asst_calls(&[("c2", "bash", "{}"), ("c3", "todo", "{}")])),
+            ev(8, result("c2", "bash", &"z".repeat(1_500))),
+            ev(9, result("c3", "todo", "[ ] plan")),
+        ];
+        assert_eq!(
+            stubbed_view(&events),
+            vec![
+                Message::System("S".into()),
+                Message::User("SUM\n\nu2".into()),
+                asst_msg("", None, vec![call("c2", "bash"), call("c3", "todo")]),
+                tool("c2", "[elided: 2KB bash output — events.jsonl seq 8]"),
+                tool("c3", "[ ] plan"),
+            ]
+        );
     }
 
     #[test]
