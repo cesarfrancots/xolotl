@@ -1,0 +1,11 @@
+{
+  "id": "rs-compile",
+  "title": "Fix a type error and a borrow error without touching the tests",
+  "tags": ["rust", "bugfix", "compile-errors"],
+  "prompt": "cargo test fails to compile in this crate. Make `cargo test` pass without modifying anything under tests/.",
+  "verify": ["{python} verify/check.py"],
+  "timeout_s": 600,
+  "verify_timeout_s": 240,
+  "budget": null,
+  "requires": ["cargo"]
+}

@@ -1,0 +1,11 @@
+{
+  "id": "long-context",
+  "title": "Find every writer of a global dict across 25 modules",
+  "tags": ["python", "long-context", "search"],
+  "prompt": "Across all modules in this project, find every function that WRITES to the global CONFIG dict from config.py (assigning a key, del, update, pop, setdefault, clear — reading doesn't count). List them in FINDINGS.md, one per line, as module:function (for example mod_03:load_defaults), sorted alphabetically.",
+  "verify": ["{python} verify/check.py"],
+  "timeout_s": 900,
+  "verify_timeout_s": 60,
+  "budget": 30000,
+  "requires": []
+}
