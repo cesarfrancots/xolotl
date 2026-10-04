@@ -82,6 +82,10 @@ impl Agent<'_> {
         let (mut steps, mut check_fired, mut edited, mut empty_retried, mut overflow_retried) = (0, false, false, false, false);
         let mut recent: Vec<Seen> = Vec::new(); // tool results since the last repeat nudge
         loop {
+            // Ctrl+C during the last tool of a batch (or at its prompt) must not send another model request
+            if self.cancel.load(Ordering::SeqCst) {
+                return self.interrupt(&[], "tool", None);
+            }
             if steps == LIMITS.step_limit {
                 if !self.ui.confirm(&format!("step limit reached ({}) — continue?", LIMITS.step_limit)) {
                     return Ok(Outcome::StepLimit);
@@ -133,16 +137,17 @@ impl Agent<'_> {
             }
             self.append(Kind::Assistant { text: text.clone(), reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms })?;
 
-            if calls.is_empty() {
-                if text.trim().is_empty() {
-                    if empty_retried {
-                        self.ui.notice("empty response");
-                        return Ok(Outcome::Error("empty response".into()));
-                    }
-                    empty_retried = true;
-                    self.append(nudge("empty", EMPTY_NUDGE.into()))?;
-                    continue;
+            if calls.is_empty() && text.trim().is_empty() {
+                if empty_retried {
+                    self.ui.notice("empty response");
+                    return Ok(Outcome::Error("empty response".into()));
                 }
+                empty_retried = true;
+                self.append(nudge("empty", EMPTY_NUDGE.into()))?;
+                continue;
+            }
+            empty_retried = false; // only back-to-back empty replies end the request (spec §11.4)
+            if calls.is_empty() {
                 if edited && !check_fired {
                     check_fired = true;
                     self.append(nudge("completion_check", policy::completion_check(request)))?;
@@ -322,6 +327,8 @@ mod tests {
         confirms: VecDeque<bool>,
         cancel_on_tool_start: Option<&'c AtomicBool>,
         cancel_on_tool_end: Option<&'c AtomicBool>,
+        /// Like Ctrl+C at a Terminal prompt: sets the flag and answers Deny.
+        cancel_on_ask: Option<&'c AtomicBool>,
     }
 
     impl Ui for TestUi<'_> {
@@ -343,6 +350,10 @@ mod tests {
         }
         fn ask(&mut self, req: &PermissionRequest) -> Decision {
             self.asks.push(req.clone());
+            if let Some(c) = self.cancel_on_ask {
+                c.store(true, Ordering::SeqCst);
+                return Decision::Deny;
+            }
             self.decisions.pop_front().unwrap_or(Decision::Deny)
         }
         fn confirm(&mut self, question: &str) -> bool {
@@ -661,6 +672,45 @@ mod tests {
         assert_eq!(r[1], ("c2".to_string(), false, "cancelled by user".to_string()));
         assert_eq!(interrupts(&session.events), [("tool".to_string(), Some("c1".to_string()))]);
         assert_eq!(ui.ended, ["c1"]);
+    }
+
+    #[test]
+    fn cancel_after_last_call_sends_no_request() {
+        // Ctrl+C at the prompt of a reply's only call (denied), and during its only, non-cancellable tool (read runs)
+        for at_prompt in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let (tag, script, mut ui) = if at_prompt {
+                ("cancelask", call("c1", "bash", r#"{"command":"ls"}"#), TestUi { cancel_on_ask: Some(&cancel), ..Default::default() })
+            } else {
+                ("cancelend", read_a("c1"), TestUi { cancel_on_tool_end: Some(&cancel), ..Default::default() })
+            };
+            let mut m = Scripted::new(vec![script, text("never")]);
+            let mut a = agent(tag, Mode::Writes, false, &mut m, &mut ui, &cancel);
+            fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+            assert_eq!(a.run_request("go"), Outcome::Interrupted, "{tag}");
+            let session = a.session;
+
+            assert_eq!(m.requests.len(), 1, "{tag}: no model request after the cancel");
+            let r = results(&session.events);
+            assert_eq!((r.len(), r[0].1), (1, !at_prompt), "{tag}: {r:?}");
+            let fake = session.events.iter().any(|e| matches!(&e.kind, Kind::Assistant { text, .. } if text.contains("[interrupted]")));
+            assert!(!fake, "{tag}: no fake interrupted assistant turn");
+            assert_eq!(interrupts(&session.events), [("tool".to_string(), None)], "{tag}");
+            assert_eq!(ui.statuses.len(), 1, "{tag}");
+        }
+    }
+
+    #[test]
+    fn empty_responses_apart_each_get_a_nudge() {
+        let mut m = Scripted::new(vec![text(""), read_a("c1"), text(""), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("emptyapart", Mode::Writes, false, &mut m, &mut ui, &cancel);
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("go"), Outcome::Done);
+        let session = a.session;
+
+        assert_eq!(nudges(&session.events, "empty").len(), 2);
+        assert_eq!(m.requests.len(), 4);
     }
 
     #[test]
