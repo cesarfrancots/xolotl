@@ -1,10 +1,16 @@
 import base64
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 
 from bench import run as local_run
+from bench.tb2 import run
 from bench.tb2.xolotl_harbor import core
+
+HERE = Path(__file__).parent
+JOB = HERE / "fixtures" / "job"
 
 
 def ev(type_: str, **fields) -> str:
@@ -81,6 +87,73 @@ class CoreTests(unittest.TestCase):
         from unittest import mock
         with mock.patch.dict(os.environ, {"ZAI_API_KEY": "k-from-env"}):
             self.assertEqual(core.read_api_key(), "k-from-env")
+
+
+class WrapperTests(unittest.TestCase):
+    def test_parse_job_statuses(self):
+        trials = {t["task"]: t for t in run.parse_job(JOB)}
+        self.assertEqual({k: v["status"] for k, v in trials.items()}, {
+            "t-pass": "pass", "t-fail": "fail",
+            "t-exit2": "pass",  # reward 1 with Xolotl's exit code 2 (step limit): the verifier decides
+            "t-setup": "infra_error", "t-nosession": "infra_error"})
+        self.assertEqual(trials["t-exit2"]["exit_code"], 2)
+        self.assertEqual(trials["t-setup"]["infra_reason"], "RuntimeError")
+        self.assertEqual(trials["t-nosession"]["infra_reason"], "no session_start event")
+        self.assertEqual(trials["t-pass"]["tokens"], {"prompt": 300, "completion": 50, "cached": 50})
+        self.assertEqual(trials["t-pass"]["agent_time_s"], 100.0)
+        self.assertEqual(trials["t-pass"]["policy_hash"], "abc12345def")
+        self.assertEqual(trials["t-pass"]["xolotl_version"], "xolotl 0.1.0")
+        # a trial that never ran the agent (no agent files, no timing) still parses
+        self.assertIsNone(trials["t-setup"]["agent_time_s"])
+        self.assertEqual(trials["t-setup"]["tokens"], {"prompt": 0, "completion": 0, "cached": 0})
+
+    def test_summarize_excludes_infra(self):
+        s = run.summarize(run.parse_job(JOB))
+        self.assertEqual((s["pass"], s["total"], s["infra"]), (2, 5, 2))
+        self.assertAlmostEqual(s["pass_rate"], 2 / 3, places=3)
+        self.assertEqual(s["tokens"], {"prompt": 1200, "completion": 200, "cached": 200})  # 4 trials ran the agent
+        self.assertEqual(s["median_agent_time_s"], 200.0)  # pass 100 s, fail 200 s, exit2 300 s; infra excluded
+
+    def test_history_row_format(self):
+        result = {"run_id": "20261004-1200-abc1234", "started": "2026-10-04T12:00:00+02:00", "dirty": False,
+                  "policy_hash": "e381398fdeadbeef", "tasks_hash": "c7bd70e76232", "note": "tb2 | smoke",
+                  "summary": run.summarize(run.parse_job(JOB))}
+        self.assertEqual(
+            run.history_row(result),
+            "| 2026-10-04 12:00 | 20261004-1200-abc1234 | e381398f | c7bd70e76232 | 2/3 (66.7%) ⚠2 infra | "
+            "1200 / 200 | 200.0s | tb2 \\| smoke |")
+        self.assertIn("(dirty)", run.history_row({**result, "dirty": True}))
+        self.assertTrue(run.HISTORY_HEADER.startswith("| Date | Run | Policy | Tasks | Pass | Tokens (in / out) | Median agent | Note |"))
+
+    def test_tasks_hash_order_independent(self):
+        self.assertEqual(run.tasks_hash(["b", "a", "c"]), run.tasks_hash(["c", "a", "b"]))
+        self.assertNotEqual(run.tasks_hash(["a", "b"]), run.tasks_hash(["a", "c"]))
+        self.assertRegex(run.tasks_hash(["a"]), r"^[0-9a-f]{12}$")
+
+    def test_secret_scan_detects_planted_key(self):
+        key = "FAKEKEY1.not-a-real-secret"
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sub").mkdir()
+            (root / "clean.txt").write_text("nothing here", encoding="utf-8")
+            self.assertEqual(run.secret_scan(root, key), [])
+            (root / "sub" / "log.txt").write_text(f"env dump: ZAI_API_KEY={key[:8]}...", encoding="utf-8")
+            self.assertEqual(run.secret_scan(root, key), [root / "sub" / "log.txt"])
+
+    def test_task_lists(self):
+        smoke, subset = run.read_task_names(HERE / "smoke.txt"), run.read_task_names(HERE / "tasks.txt")
+        self.assertEqual((len(smoke), len(subset)), (2, 15))
+        self.assertEqual(len(set(subset)), 15)
+        self.assertTrue(all(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", t) for t in smoke + subset))
+
+    def test_key_never_in_argv(self):
+        cmd = run.harbor_command("harbor", ["a", "b"], Path("/x/xolotl"), Path("/jobs"), "job1", 1)
+        self.assertEqual(cmd[cmd.index("-n") + 1], "1")
+        self.assertEqual([cmd[i + 1] for i, c in enumerate(cmd) if c == "-i"], ["a", "b"])
+        env = run.harbor_env("sekrit-key")
+        self.assertEqual(env[core.KEY_ENV], "sekrit-key")
+        self.assertFalse(any("sekrit-key" in part for part in cmd))
+        self.assertIn(str(HERE), env["PYTHONPATH"])
 
 
 if __name__ == "__main__":

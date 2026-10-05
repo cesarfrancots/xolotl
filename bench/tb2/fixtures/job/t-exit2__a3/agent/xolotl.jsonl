@@ -1,0 +1,5 @@
+{"type": "session_start", "cwd": "/app", "model": "glm-5.3-flash", "mode": "yolo", "policy_hash": "abc12345def", "system": ""}
+{"type": "assistant", "text": "x", "usage": {"prompt": 100, "completion": 20, "cached": 50}}
+{"type": "tool_result", "id": "1", "output": "ok"}
+{"type": "assistant", "text": "done", "usage": {"prompt": 200, "completion": 30, "cached": 0}}
+{"type": "session_end", "status": "step_limit"}
