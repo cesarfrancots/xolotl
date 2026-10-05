@@ -7,7 +7,8 @@ Windows 11 + Git Bash is the primary platform. Run everything from the repo root
 
 ## Prerequisites
 
-- Docker Desktop with the Linux engine (TB2 images are linux/amd64). Expect several GB of image pulls the first time.
+- Docker Desktop with the Linux engine (TB2 images are linux/amd64). Each task image is about 0.5 GB or more and is
+  pulled on first use, then cached (the smoke pair is about 1.1 GB).
 - [uv](https://docs.astral.sh/uv/) and Harbor 0.23.x: `uv tool install harbor` (uv fetches a Python >= 3.12 for it).
   `harbor --version` must work from the shell that runs the wrapper.
 - `ZAI_API_KEY` in the process environment or the Windows User environment (read with `reg query`, as Xolotl does).
@@ -53,6 +54,9 @@ Each run writes `results/<run_id>.json` (`run_id` = `YYYYMMDD-HHMM-<sha7>`, also
 `jobs/<run_id>/`, git-ignored) and appends a row to `results/HISTORY.md`:
 `Date | Run | Policy | Tasks | Pass | Tokens (in / out) | Median agent | Note`. `Tasks` is the sha256 (12 hex) of the sorted
 task names, so two rows are comparable only when it matches.
+
+A trial's `exit_code` is Xolotl's own: 0 done, 2 step limit, 124 `timeout` stopped it at its time budget (the verifier
+still grades whatever it left behind).
 
 Per trial: `status` is `pass` (verifier reward >= 1), `fail`, or `infra_error`. A trial with no verifier result (setup,
 environment or verifier exception), or whose `xolotl.jsonl` has no `session_start` or an unretried `llm` error, says
