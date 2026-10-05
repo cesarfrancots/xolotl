@@ -6,6 +6,7 @@ interpreter can't import the `bench` package without path hacks); test_tb2 asser
 import base64
 import json
 import os
+import shlex
 import subprocess
 from collections.abc import Iterable, Iterator
 
@@ -30,12 +31,13 @@ def timeout_budget(agent_timeout_sec: float | None) -> int:
 def run_command(instruction: str, model: str, timeout_s: int) -> str:
     """The shell command run in the task container. The instruction travels base64-encoded, so no quote, `$()`, newline
     or unicode in it can break or inject into the command. Always exits 0: Xolotl's own exit code goes to
-    /logs/agent/exit_code, so it never becomes a Harbor exception and the verifier decides pass or fail."""
+    /logs/agent/exit_code, so it never becomes a Harbor exception and the verifier decides pass or fail. `timeout -k 5`
+    sends SIGKILL 5 s after SIGTERM, so Xolotl is guaranteed to be gone before the logs are copied."""
     b64 = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
     return (
         f'cd "$PWD"\n'  # the task's own WORKDIR, not always /app
-        f"timeout {int(timeout_s)} {BINARY} -p \"$(printf %s '{b64}' | base64 -d)\" --mode yolo --cwd \"$PWD\" "
-        f"--model {model} > {LOGS}/xolotl.jsonl 2> {LOGS}/xolotl.stderr < /dev/null\n"
+        f"timeout -k 5 {int(timeout_s)} {BINARY} -p \"$(printf %s '{b64}' | base64 -d)\" --mode yolo --cwd \"$PWD\" "
+        f"--model {shlex.quote(model)} > {LOGS}/xolotl.jsonl 2> {LOGS}/xolotl.stderr < /dev/null\n"
         f"echo $? > {LOGS}/exit_code\n"
         f"mkdir -p {LOGS}/xolotl-home && cp -r /root/.xolotl/. {LOGS}/xolotl-home/ 2>/dev/null\n"
         "true"
@@ -124,7 +126,7 @@ def _infra_reason(events: list[dict]) -> str:
 def metrics_from_jsonl(text: str) -> dict:
     """bench.run's metrics for the text of xolotl.jsonl, plus `infra_reason` (None when the run says something about
     the agent)."""
-    lines = text.splitlines()
+    lines = text.split("\n")  # not splitlines(): U+2028, U+2029 and U+0085 may sit unescaped inside a JSON string
     m = metrics_from_events(lines)
     m["infra_reason"] = _infra_reason(list(_events(lines))) or None
     return m

@@ -1,6 +1,7 @@
 {
   "task_name": "t-exit2",
   "trial_name": "t-exit2__a3",
+  "task_checksum": "checksum-of-t-exit2",
   "agent_info": {
     "name": "xolotl",
     "version": "xolotl 0.1.0",

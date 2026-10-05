@@ -1,0 +1,35 @@
+{
+  "task_name": "t-verifier-timeout",
+  "trial_name": "t-verifier-timeout__b3",
+  "task_checksum": "checksum-of-t-verifier-timeout",
+  "agent_info": {
+    "name": "xolotl",
+    "version": "xolotl 0.1.0",
+    "model_info": {
+      "name": "glm-5.3-flash",
+      "provider": "zai"
+    }
+  },
+  "verifier_result": null,
+  "exception_info": {
+    "exception_type": "VerifierTimeoutError",
+    "exception_message": "Verifier execution timed out",
+    "exception_traceback": "",
+    "occurred_at": "2026-10-04T10:00:00Z"
+  },
+  "agent_execution": {
+    "started_at": "2026-10-04T10:00:00Z",
+    "finished_at": "2026-10-04T10:06:40Z"
+  },
+  "agent_result": {
+    "n_input_tokens": 300,
+    "n_cache_tokens": 50,
+    "n_output_tokens": 50,
+    "metadata": {
+      "model_calls": 2,
+      "tool_calls": 1,
+      "exit_code": 0,
+      "infra_reason": null
+    }
+  }
+}

@@ -1,6 +1,7 @@
 {
   "task_name": "t-setup",
   "trial_name": "t-setup__a4",
+  "task_checksum": "checksum-of-t-setup",
   "agent_info": {
     "name": "xolotl",
     "version": "xolotl 0.1.0",

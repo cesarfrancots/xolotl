@@ -1,6 +1,7 @@
 {
   "task_name": "t-nosession",
   "trial_name": "t-nosession__a5",
+  "task_checksum": "checksum-of-t-nosession",
   "agent_info": {
     "name": "xolotl",
     "version": "xolotl 0.1.0",

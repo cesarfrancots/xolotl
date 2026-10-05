@@ -41,7 +41,7 @@ def main(argv: list[str]) -> int:
         return 1
     repo = str(REPO_ROOT)
     build = ("apk add --no-cache musl-dev >/dev/null && "
-             f"cargo build --release --target {TARGET}")
+             f"cargo build --release --locked --target {TARGET}")  # --locked: the build must use Cargo.lock as committed
     r = _docker("run", "--rm", "-v", f"{repo}:/src", "-v", f"{REGISTRY_VOLUME}:/usr/local/cargo/registry",
                 "-w", "/src", IMAGE, "sh", "-c", build)
     if r.returncode != 0:
