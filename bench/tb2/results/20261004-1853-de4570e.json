@@ -1,0 +1,486 @@
+{
+  "run_id": "20261004-1853-de4570e",
+  "job_name": "20261004-1853-de4570e",
+  "reparsed": true,
+  "parser_git_sha": "081eba7d98244d578870b7ba7cb6e6a668941207",
+  "started": "2026-10-04T18:54:22-06:00",
+  "git_sha": "de4570e",
+  "dirty": null,
+  "harbor_version": null,
+  "binary_sha256": "e020c273a3b90b22ee732e5166be70cf67c40e347cf28d9f2b77b7960a3a2a96",
+  "dataset": "terminal-bench@2.0",
+  "model": "zai/glm-5.3-flash",
+  "concurrency": 1,
+  "note": "tb2 v1 baseline (15-task subset)",
+  "partial": false,
+  "harbor_exit_code": null,
+  "xolotl_version": "xolotl 0.1.0",
+  "policy_hash": "e381398ffa98e555",
+  "tasks": [
+    "fix-git",
+    "cobol-modernization",
+    "prove-plus-comm",
+    "log-summary-date-ranges",
+    "build-cython-ext",
+    "db-wal-recovery",
+    "build-pmars",
+    "nginx-request-logging",
+    "raman-fitting",
+    "fix-code-vulnerability",
+    "password-recovery",
+    "cancel-async-tasks",
+    "model-extraction-relu-logits",
+    "configure-git-webserver",
+    "sparql-university"
+  ],
+  "tasks_hash": "c7bd70e76232",
+  "trials": [
+    {
+      "task": "build-cython-ext",
+      "trial": "build-cython-ext__MYPLU2U",
+      "task_checksum": "b2ebd472f76bc5cd2a5bcfefe4b37c1dea0171329e3ab2ea9b29aa5e89f27f76",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 2137168,
+        "completion": 30551,
+        "cached": 2069952
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 61,
+        "tool_calls": 102,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 755.112,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "build-pmars",
+      "trial": "build-pmars__zsaYCqw",
+      "task_checksum": "25a52ad81d0ac4970db696a883f9b8e018826f979026218d68bd851c1ecda7fb",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 1521272,
+        "completion": 20533,
+        "cached": 1463872
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 55,
+        "tool_calls": 66,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 547.041,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "cancel-async-tasks",
+      "trial": "cancel-async-tasks__zKtjF58",
+      "task_checksum": "f825357f881bcb6e984902da1479587142a1f7e6b1746cf4e41146b509ade242",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 499864,
+        "completion": 35032,
+        "cached": 462464
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 20,
+        "tool_calls": 22,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.54,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "cobol-modernization",
+      "trial": "cobol-modernization__moqBAvx",
+      "task_checksum": "def98d1cb8485087d945d0189a22da7fb4a082e36d4b1f2b99a2b20da9975cb7",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 459520,
+        "completion": 35986,
+        "cached": 414528
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 17,
+        "tool_calls": 20,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.227,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "configure-git-webserver",
+      "trial": "configure-git-webserver__mzxdxWt",
+      "task_checksum": "ecc3e03cd1563b02acda3c15d5507425f6d777785938aa675ff7a58a9e74ecd7",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 166822,
+        "completion": 12989,
+        "cached": 148672
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 15,
+        "tool_calls": 20,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 339.487,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "db-wal-recovery",
+      "trial": "db-wal-recovery__kDWjRTG",
+      "task_checksum": "d28f6f35320d91b3f6e3daa6226d86bf59a94876d992df75522c0719be75c530",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 37214,
+        "completion": 4137,
+        "cached": 29504
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 8,
+        "tool_calls": 9,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 93.967,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "fix-code-vulnerability",
+      "trial": "fix-code-vulnerability__ynWz4eB",
+      "task_checksum": "7f0e237d649bd33dc85d81dba4d115b2fab334bb6a5462d6fda3f5d3d7a94282",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 85565,
+        "completion": 3632,
+        "cached": 74752
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 15,
+        "tool_calls": 17,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 89.905,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "fix-git",
+      "trial": "fix-git__ncYLfkC",
+      "task_checksum": "485519dd203d247a047ab4f911ae0e11df1210397b2fa7df62a3b0edc3f9eaba",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 78907,
+        "completion": 4120,
+        "cached": 71104
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 15,
+        "tool_calls": 18,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 124.661,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "log-summary-date-ranges",
+      "trial": "log-summary-date-ranges__QwhbuoR",
+      "task_checksum": "3f488972143fb482c5dbdde41ea6e7b7b7d0d45c26fcc6a4fc503b57cfa95a9f",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 204146,
+        "completion": 5092,
+        "cached": 179456
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 13,
+        "tool_calls": 12,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 133.304,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "model-extraction-relu-logits",
+      "trial": "model-extraction-relu-logits__xHeZWFv",
+      "task_checksum": "0d79c66871e038bd44d8f4f5e4c0001a7e1c660e89983862ac7ef1975f6efdab",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 109855,
+        "completion": 30359,
+        "cached": 31552
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 5,
+        "tool_calls": 6,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.433,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "nginx-request-logging",
+      "trial": "nginx-request-logging__fjpqXfT",
+      "task_checksum": "095d6ee0b0741504dc2fde4718eb835b1858dc1df0abaaf47b294a68787e005a",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 130157,
+        "completion": 5284,
+        "cached": 117632
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 21,
+        "tool_calls": 21,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 148.104,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "password-recovery",
+      "trial": "password-recovery__BvGauQo",
+      "task_checksum": "137dab653f4636a40078c8c1daa605564d4609cba21c5e20304d67c9cc3e969e",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 284173,
+        "completion": 9146,
+        "cached": 258496
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 18,
+        "tool_calls": 25,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 237.866,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "prove-plus-comm",
+      "trial": "prove-plus-comm__N4hWVrG",
+      "task_checksum": "aa6f39500bd995ee34b5dbc5b33bd4a6172663ef748b736488187fa5a6227bb2",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 93322,
+        "completion": 7383,
+        "cached": 83008
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 13,
+        "tool_calls": 12,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 177.445,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "raman-fitting",
+      "trial": "raman-fitting__TN8myyD",
+      "task_checksum": "39a95c98a3761bbf860be5f14a0e47f4d8063d0ab1456ed50b1fb908f1462c9e",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 255489,
+        "completion": 35158,
+        "cached": 214016
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 14,
+        "tool_calls": 16,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.429,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "sparql-university",
+      "trial": "sparql-university__TLz7J46",
+      "task_checksum": "927de475169447a2fe3a6070c4550074e073779c2f0c418e124fa33d7073aaca",
+      "status": "infra_error",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "llm error: network error: Peer disconnected",
+      "exit_code": 1,
+      "tokens": {
+        "prompt": 68894,
+        "completion": 7480,
+        "cached": 56448
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 8,
+        "tool_calls": 9,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 1,
+        "infra_reason": "llm error: network error: Peer disconnected"
+      },
+      "agent_time_s": 246.503,
+      "xolotl_version": "xolotl 0.1.0"
+    }
+  ],
+  "summary": {
+    "pass": 11,
+    "total": 15,
+    "infra": 1,
+    "pass_rate": 0.786,
+    "tokens": {
+      "prompt": 6132368,
+      "completion": 246882,
+      "cached": 5675456
+    },
+    "median_agent_time_s": 288.677
+  }
+}
