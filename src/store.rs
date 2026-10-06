@@ -19,7 +19,20 @@ pub struct Event {
 pub enum Kind {
     SessionStart { cwd: String, model: String, mode: String, policy_hash: String, system: String },
     User { text: String },
-    Assistant { text: String, reasoning: String, tool_calls: Vec<ToolCall>, usage: Usage, finish_reason: String, latency_ms: u64 },
+    Assistant {
+        text: String,
+        reasoning: String,
+        tool_calls: Vec<ToolCall>,
+        usage: Usage,
+        finish_reason: String,
+        latency_ms: u64,
+        /// The `reasoning_effort` the request carried; absent: none was sent (the API default, `max`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        /// Milliseconds of reasoning before the first content or tool-call token (the whole call if none came).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        think_ms: Option<u64>,
+    },
     ToolResult {
         call_id: String,
         name: String,
@@ -346,6 +359,8 @@ mod tests {
                 usage: Usage { prompt: 10, completion: 2, cached: 3 },
                 finish_reason: "tool_calls".into(),
                 latency_ms: 7,
+                effort: Some("medium".into()),
+                think_ms: Some(5),
             },
             Kind::ToolResult { call_id: "c1".into(), name: "bash".into(), ok: true, output: "o".into(), artifact: Some("artifacts/c1.txt".into()), bytes: 1, duration_ms: 2, exit_code: Some(-1) },
             Kind::ToolResult { call_id: "c2".into(), name: "read".into(), ok: false, output: "o".into(), artifact: None, bytes: 1, duration_ms: 2, exit_code: None },
@@ -403,6 +418,27 @@ mod tests {
     }
 
     #[test]
+    fn assistant_trace_fields_are_additive() {
+        let a = |effort: Option<&str>, think_ms: Option<u64>| Kind::Assistant {
+            text: "t".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            usage: Usage::default(),
+            finish_reason: "stop".into(),
+            latency_ms: 1,
+            effort: effort.map(Into::into),
+            think_ms,
+        };
+        // an event without them serializes exactly as it did before, and an old line still loads
+        let bare = serde_json::to_string(&a(None, None)).unwrap();
+        assert!(!bare.contains("effort") && !bare.contains("think_ms"), "{bare}");
+        assert_eq!(serde_json::from_str::<Kind>(&bare).unwrap(), a(None, None));
+        let full = serde_json::to_string(&a(Some("low"), Some(1500))).unwrap();
+        assert!(full.contains(r#""effort":"low""#) && full.contains(r#""think_ms":1500"#), "{full}");
+        assert_eq!(serde_json::from_str::<Kind>(&full).unwrap(), a(Some("low"), Some(1500)));
+    }
+
+    #[test]
     fn repair_dangling_tool_calls() {
         let root = test_dir("dangling");
         let mut s = Session::create(&root, meta("20250101-000000-0001")).unwrap();
@@ -414,6 +450,8 @@ mod tests {
             usage: Usage::default(),
             finish_reason: "tool_calls".into(),
             latency_ms: 5,
+            effort: None,
+            think_ms: None,
         })
         .unwrap();
         s.append(Kind::ToolResult { call_id: "c1".into(), name: "bash".into(), ok: true, output: "x".into(), artifact: None, bytes: 1, duration_ms: 1, exit_code: Some(0) }).unwrap();

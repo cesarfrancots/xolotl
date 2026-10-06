@@ -264,13 +264,13 @@ impl Agent<'_> {
             steps += 1;
             *tool_calls += reply.tool_calls.len();
             let latency_ms = t0.elapsed().as_millis() as u64;
-            let Reply { text, reasoning, tool_calls: calls, usage, finish_reason, interrupted } = reply;
+            let Reply { text, reasoning, tool_calls: calls, usage, finish_reason, interrupted, think_ms, effort } = reply;
             if interrupted {
                 let text = format!("{text}\n[interrupted]");
-                self.append(Kind::Assistant { text, reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms })?;
+                self.append(Kind::Assistant { text, reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms, effort, think_ms })?;
                 return self.interrupt(&calls, "stream", None);
             }
-            self.append(Kind::Assistant { text: text.clone(), reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms })?;
+            self.append(Kind::Assistant { text: text.clone(), reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms, effort, think_ms })?;
 
             if calls.is_empty() && text.trim().is_empty() {
                 if empty_retried {
@@ -648,6 +648,8 @@ mod tests {
             usage: Usage::default(),
             finish_reason: "stop".into(),
             latency_ms: 0,
+            effort: None,
+            think_ms: None,
         };
         a.session.append(reply).unwrap();
     }
@@ -730,6 +732,38 @@ mod tests {
         let Agent { session, .. } = a;
         assert_eq!(m.caps, [None]); // the cap is lifted explicitly, so an earlier one cannot stick
         assert!(nudges(&session.events, "time").is_empty());
+    }
+
+    /// `(effort, think_ms)` of every assistant event.
+    fn trace_fields(events: &[Event]) -> Vec<(Option<String>, Option<u64>)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Assistant { effort, think_ms, .. } => Some((effort.clone(), *think_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assistant_events_record_the_effort_sent_and_the_think_time() {
+        let thought = Reply { reasoning: "hmm".into(), think_ms: Some(4_200), ..read_a("c1").unwrap() };
+        let mut m = Scripted::new(vec![Ok(thought), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("tracefields", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(400, 1000)); // medium
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(trace_fields(&session.events), [(Some("medium".to_string()), Some(4_200)), (Some("medium".to_string()), None)]);
+
+        // no deadline: nothing is sent, so nothing is recorded as sent
+        let mut m = Scripted::new(vec![text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("tracefields2", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        assert_eq!(a.run_request("hi"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(trace_fields(&session.events), [(None, None)]);
     }
 
     #[test]
@@ -1258,6 +1292,8 @@ mod tests {
             usage: Usage::default(),
             finish_reason: "stop".into(),
             latency_ms: 0,
+            effort: None,
+            think_ms: None,
         };
         let big = "r".repeat(5_000);
         a.session.append(Kind::User { text: "earlier".into() }).unwrap();

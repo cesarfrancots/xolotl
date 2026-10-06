@@ -522,11 +522,11 @@ mod tests {
         Kind::User { text: s.into() }
     }
     fn asst(text: &str, reasoning: &str) -> Kind {
-        Kind::Assistant { text: text.into(), reasoning: reasoning.into(), tool_calls: vec![], usage: Usage::default(), finish_reason: "stop".into(), latency_ms: 0 }
+        Kind::Assistant { text: text.into(), reasoning: reasoning.into(), tool_calls: vec![], usage: Usage::default(), finish_reason: "stop".into(), latency_ms: 0, effort: None, think_ms: None }
     }
     fn asst_calls(calls: &[(&str, &str, &str)]) -> Kind {
         let tool_calls = calls.iter().map(|(id, name, args)| ToolCall { id: (*id).into(), name: (*name).into(), args: (*args).into() }).collect();
-        Kind::Assistant { text: String::new(), reasoning: String::new(), tool_calls, usage: Usage::default(), finish_reason: "tool_calls".into(), latency_ms: 0 }
+        Kind::Assistant { text: String::new(), reasoning: String::new(), tool_calls, usage: Usage::default(), finish_reason: "tool_calls".into(), latency_ms: 0, effort: None, think_ms: None }
     }
     fn result(id: &str, name: &str, output: &str) -> Kind {
         Kind::ToolResult { call_id: id.into(), name: name.into(), ok: true, output: output.into(), artifact: None, bytes: output.len() as u64, duration_ms: 0, exit_code: None }

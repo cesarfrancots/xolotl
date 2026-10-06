@@ -62,6 +62,11 @@ pub enum Delta<'a> { Text(&'a str), Reasoning(&'a str), Notice(String) }
 pub struct Reply {
     pub text: String, pub reasoning: String, pub tool_calls: Vec<ToolCall>,
     pub usage: Usage, pub finish_reason: String, pub interrupted: bool,
+    /// Milliseconds from the first reasoning token to the first content or tool-call token (or to the end of the call
+    /// if none came; 0 without reasoning). `None`: the model does not measure it.
+    pub think_ms: Option<u64>,
+    /// The `reasoning_effort` the request carried; `None`: none was sent, so the API default (`max`) applied.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -121,7 +126,9 @@ impl Model for Scripted {
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), _cancel: &AtomicBool) -> Result<Reply, LlmError> {
         self.requests.push((messages.to_vec(), tools.len()));
-        let reply = self.replies.pop_front().unwrap_or_else(|| Err(LlmError::Network("script exhausted".into())))?;
+        let mut reply = self.replies.pop_front().unwrap_or_else(|| Err(LlmError::Network("script exhausted".into())))?;
+        // like a client with no configured effort: the last cap it was given is what the request carried
+        reply.effort = lower_effort(None, self.caps.last().and_then(|c| c.as_deref())).map(String::from);
         if !reply.reasoning.is_empty() { on(Delta::Reasoning(&reply.reasoning)); }
         if !reply.text.is_empty() { on(Delta::Text(&reply.text)); }
         Ok(reply)
@@ -156,10 +163,15 @@ impl ZaiClient {
         ZaiClient { cfg, agent, idle: IDLE_TIMEOUT, effort_cap: None }
     }
 
+    /// The configured reasoning effort, lowered to the current cap.
+    fn effort(&self) -> Option<&str> {
+        lower_effort(self.cfg.reasoning_effort.as_deref(), self.effort_cap.as_deref())
+    }
+
     /// The request body, with the reasoning effort lowered to the current cap.
     fn body(&self, messages: &[Message], tools: &[Value]) -> Value {
         let mut b = request_body(&self.cfg, messages, tools);
-        if let Some(e) = lower_effort(self.cfg.reasoning_effort.as_deref(), self.effort_cap.as_deref()) { b["reasoning_effort"] = json!(e); }
+        if let Some(e) = self.effort() { b["reasoning_effort"] = json!(e); }
         b
     }
 
@@ -184,9 +196,11 @@ impl ZaiClient {
                cancel: &AtomicBool) -> Result<Reply, (LlmError, Option<u64>)> {
         let rx = self.open(body);
         let (mut status, mut done, mut last) = (0, false, Instant::now());
+        let mut think = Think::default();
         loop {
             if cancel.load(Ordering::Relaxed) {
                 state.reply.interrupted = true;
+                state.reply.think_ms = Some(think.ms());
                 return Ok(finish(std::mem::take(state)));
             }
             let msg = match rx.recv_timeout(POLL) {
@@ -207,7 +221,10 @@ impl ZaiClient {
                     match sse_data(&line) {
                         Some("[DONE]") => { done = true; break; }
                         // ponytail: unparseable data lines are skipped.
-                        Some(data) => if let Ok(chunk) = serde_json::from_str::<Value>(data) { apply_chunk(state, &chunk, on) },
+                        Some(data) => if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+                            apply_chunk(state, &chunk, on);
+                            think.seen(state);
+                        },
                         None => {}
                     }
                 }
@@ -216,7 +233,25 @@ impl ZaiClient {
         if !stream_complete(done, &state.reply.finish_reason) {
             return Err((LlmError::Network("stream ended before [DONE]".into()), None));
         }
+        state.reply.think_ms = Some(think.ms());
         Ok(finish(std::mem::take(state)))
+    }
+}
+
+/// When a call's thinking started (first reasoning token) and ended (first content or tool-call token).
+#[derive(Default)]
+struct Think { start: Option<Instant>, end: Option<Instant> }
+
+impl Think {
+    /// Called after every applied chunk.
+    fn seen(&mut self, st: &StreamState) {
+        if self.start.is_none() && !st.reply.reasoning.is_empty() { self.start = Some(Instant::now()); }
+        if self.end.is_none() && (!st.reply.text.is_empty() || !st.calls.is_empty()) { self.end = Some(Instant::now()); }
+    }
+
+    /// Milliseconds spent thinking so far: until the output began, or until now if it has not.
+    fn ms(&self) -> u64 {
+        self.start.map_or(0, |s| self.end.unwrap_or_else(Instant::now).saturating_duration_since(s).as_millis() as u64)
     }
 }
 
@@ -255,16 +290,17 @@ impl Model for ZaiClient {
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), cancel: &AtomicBool) -> Result<Reply, LlmError> {
         let body = self.body(messages, tools).to_string();
+        let effort = self.effort().map(String::from);
         let mut n = 0;
         loop {
             let mut state = StreamState::default();
             let (err, retry_after) = match self.attempt(&body, &mut state, on, cancel) {
-                Ok(reply) => return Ok(reply),
+                Ok(reply) => return Ok(Reply { effort, ..reply }),
                 Err(e) => e,
             };
             let Some(delay) = retry_delay(&err, n, state.emitted, retry_after) else { return Err(err) };
             on(Delta::Notice(format!("{err}; retrying in {}s", delay.as_secs())));
-            if !wait(delay, cancel) { return Ok(Reply { interrupted: true, ..Default::default() }); }
+            if !wait(delay, cancel) { return Ok(Reply { interrupted: true, effort, ..Default::default() }); }
             n += 1;
         }
     }
@@ -652,7 +688,10 @@ mod tests {
     }
 
     /// Localhost server: accepts one connection, reads the whole request, sends `reply`, holds the socket open for `hold`, then closes.
-    fn server(reply: &'static str, hold: Duration) -> ZaiClient {
+    fn server(reply: &'static str, hold: Duration) -> ZaiClient { server_parts(vec![(reply, hold)]) }
+
+    /// Like `server`, but writes each part and then sleeps its duration before the next one (the last sleep is the hold).
+    fn server_parts(parts: Vec<(&'static str, Duration)>) -> ZaiClient {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", l.local_addr().unwrap());
@@ -663,8 +702,10 @@ mod tests {
             let len = String::from_utf8_lossy(&head).to_lowercase().split("content-length:").nth(1)
                 .and_then(|v| v.lines().next()?.trim().parse().ok()).unwrap_or(0);
             s.read_exact(&mut vec![0u8; len]).unwrap();
-            s.write_all(reply.as_bytes()).unwrap();
-            std::thread::sleep(hold);
+            for (part, pause) in parts {
+                s.write_all(part.as_bytes()).unwrap();
+                std::thread::sleep(pause);
+            }
         });
         ZaiClient::new(ZaiConfig { base_url, model: "m".into(), api_key: "k".into(), temperature: 1.0, top_p: 0.95, reasoning_effort: None })
     }
@@ -687,6 +728,41 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let r = c.complete(&[], &[], &mut |d| if let Delta::Reasoning(_) = d { cancel.store(true, Ordering::Relaxed) }, &cancel).unwrap();
         assert_eq!((r.interrupted, r.reasoning.as_str()), (true, "half a thought"));
+    }
+    // A reply is the HTTP head plus its first chunk; ANSWER can follow as a later part.
+    const THINKING: &str = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"half a thought\"}}]}\n\n";
+    const ANSWERED: &str = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}]}\n\n";
+    const ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":\"stop\"}]}\n\n";
+
+    #[test] fn think_ms_runs_from_the_first_reasoning_to_the_first_output() {
+        let mut c = server_parts(vec![(THINKING, Duration::from_millis(400)), (ANSWER, Duration::ZERO)]);
+        let r = c.complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(r.text, "b");
+        assert!((400..2000).contains(&r.think_ms.unwrap()), "{:?}", r.think_ms);
+        // no reasoning at all: no thinking time
+        let r = server(ANSWERED, Duration::ZERO).complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(r.think_ms, Some(0));
+    }
+    #[test] fn think_ms_is_kept_when_the_call_is_cancelled() {
+        let mut c = server(THINKING, Duration::from_secs(3));
+        let cancel = AtomicBool::new(false);
+        let r = std::thread::scope(|s| {
+            s.spawn(|| { std::thread::sleep(Duration::from_millis(500)); cancel.store(true, Ordering::Relaxed); });
+            c.complete(&[], &[], &mut |_| {}, &cancel)
+        }).unwrap();
+        assert!(r.interrupted && r.think_ms.is_some_and(|ms| ms >= 300), "{:?}", r.think_ms);
+    }
+    #[test] fn reply_carries_the_effort_sent() {
+        let run = |base: Option<&str>, cap: Option<&str>| {
+            let mut c = server(ANSWERED, Duration::ZERO);
+            c.cfg.reasoning_effort = base.map(String::from);
+            c.cap_effort(cap);
+            c.complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap().effort
+        };
+        assert_eq!(run(Some("max"), None).as_deref(), Some("max"));
+        assert_eq!(run(Some("max"), Some("medium")).as_deref(), Some("medium"));
+        assert_eq!(run(Some("low"), Some("medium")).as_deref(), Some("low")); // a cap never raises
+        assert_eq!(run(None, None), None); // nothing sent: the API default applied
     }
     #[test] fn silent_server_trips_idle_timeout_and_retries() {
         let mut c = server("", Duration::from_secs(3));

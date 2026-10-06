@@ -868,7 +868,7 @@ mod tests {
         let mut s = test_session("headless-resume");
         s.append(Kind::User { text: "go".into() }).unwrap();
         let call = llm::ToolCall { id: "c1".into(), name: "read".into(), args: "{}".into() };
-        let reply = Kind::Assistant { text: String::new(), reasoning: String::new(), tool_calls: vec![call], usage: llm::Usage::default(), finish_reason: "tool_calls".into(), latency_ms: 0 };
+        let reply = Kind::Assistant { text: String::new(), reasoning: String::new(), tool_calls: vec![call], usage: llm::Usage::default(), finish_reason: "tool_calls".into(), latency_ms: 0, effort: None, think_ms: None };
         s.append(reply).unwrap();
         let (s, startup) = open_session(&s.dir).unwrap();
         assert_eq!(startup, 3);
