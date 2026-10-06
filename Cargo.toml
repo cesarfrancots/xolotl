@@ -1,0 +1,15 @@
+[package]
+name = "xolotl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossterm = "0.29.0"
+ctrlc = "3.5.2"
+globset = "0.4.20"
+ignore = "0.4.33"
+reedline = "0.52.1"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = "3.4.2"
