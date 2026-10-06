@@ -35,7 +35,7 @@ use ui::{Headless, Status, Terminal, Ui, status_line};
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str =
-    "usage: xolotl [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>] [--version]";
+    "usage: xol [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>] [--version]";
 /// The `reasoning_effort` values the API documents. It silently accepts any other value (docs/glm-api-notes.md #5).
 const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const SLASH_COMMANDS: [&str; 8] = ["/help", "/mode", "/compact", "/clear", "/resume", "/think", "/status", "/exit"];

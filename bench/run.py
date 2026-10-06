@@ -513,7 +513,7 @@ def main(argv: list[str]) -> int:
                 return 1
             try:
                 bin_dir = tempfile.mkdtemp(prefix="xolotl-bin-")  # a copy, so a later rebuild can't hit a locked .exe
-                cmd = [shutil.copy2(REPO_ROOT / "target" / "release" / ("xolotl.exe" if os.name == "nt" else "xolotl"), bin_dir)]
+                cmd = [shutil.copy2(REPO_ROOT / "target" / "release" / ("xol.exe" if os.name == "nt" else "xol"), bin_dir)]
             except OSError as e:
                 print(f"error: cannot copy the built xolotl: {e}", file=sys.stderr)
                 return 1

@@ -14,7 +14,7 @@ REGISTRY_VOLUME = "xolotl-cargo-registry"  # named volume: cargo's registry surv
 
 
 def binary_path(repo_root: Path) -> Path:
-    return repo_root / "target" / TARGET / "release" / "xolotl"
+    return repo_root / "target" / TARGET / "release" / "xol"
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess:

@@ -3,6 +3,11 @@ name = "xolotl"
 version = "0.1.0"
 edition = "2024"
 
+# The installed command is `xol` (like `claude`); the project is still Xolotl.
+[[bin]]
+name = "xol"
+path = "src/main.rs"
+
 [dependencies]
 crossterm = "0.29.0"
 ctrlc = "3.5.2"
