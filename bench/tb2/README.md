@@ -28,7 +28,8 @@ py bench/tb2/run.py --reparse bench/tb2/jobs/<run_id> --note "..."   # re-derive
 py -m unittest bench.tb2.test_tb2 -v                  # tests for the pure helpers
 ```
 
-Options: `-n N` Harbor concurrency (default 1, to keep Docker load low), `--no-build` reuse the built binary,
+Options: `-n N` Harbor concurrency (default 1, to keep Docker load low), `-k N` attempts per task (default 1; one
+trial per task swings about ±2 tasks run to run on the hard set, so compare changes at `-k 3`), `--no-build` reuse the built binary,
 `--jobs-dir`, `--results-dir`. The wrapper builds the static musl binary first (`build_linux.py`: `rust:1.95-alpine` in
 Docker with `cargo build --release --locked`, cargo registry cached in the `xolotl-cargo-registry` volume, then checks the
 ELF has no dynamic loader), runs
