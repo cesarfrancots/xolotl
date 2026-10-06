@@ -22,7 +22,9 @@ pub struct Limits {
     pub snapshot_timeout_s: u64,
     pub agents_md_max: usize,
     pub toc_user_chars: usize,
-    /// With a deadline: below this many seconds left the reasoning effort is capped at `medium`, below the next at `low`.
+    /// With a deadline: below this many seconds left the reasoning effort is capped at `high`, below the next at `medium`,
+    /// below the last at `low`.
+    pub effort_high_below_s: u64,
     pub effort_medium_below_s: u64,
     pub effort_low_below_s: u64,
     /// With a deadline: the percentages of the budget left at which a `time` nudge is added (descending).
@@ -49,8 +51,11 @@ pub const LIMITS: Limits = Limits {
     agents_md_max: 20_000,
     toc_user_chars: 500,
     // ponytail: read off the TB2 hard-set traces (~45 tokens/s; a max-effort call thinks 8-24k tokens = 3-10 min), not tuned.
-    // Ceiling: one step function for every task and a call already in flight keeps its effort (think_cap below bounds one call).
-    effort_medium_below_s: 1000,
+    // `high` (not `medium`) from 1000 s: r1/r2 started 900 s tasks at `medium` and lost polyglot-rust-c and make-mips-interpreter
+    // twice. Ceiling: one step function for every task and a call already in flight keeps its effort (think_cap below bounds
+    // one call). Upgrade: thresholds learned from the per-call `effort`/`think_ms` the trace now records.
+    effort_high_below_s: 1000,
+    effort_medium_below_s: 480,
     effort_low_below_s: 240,
     time_note_pct: [50, 20],
     // ponytail: read off the r1 traces: the one runaway thought (polyglot-rust-c: 840 s, no tool call) vs the longest productive
@@ -162,6 +167,7 @@ pub fn effort_cap(remaining: Duration) -> Option<&'static str> {
     match remaining.as_secs() {
         s if s < LIMITS.effort_low_below_s => Some("low"),
         s if s < LIMITS.effort_medium_below_s => Some("medium"),
+        s if s < LIMITS.effort_high_below_s => Some("high"),
         _ => None,
     }
 }
@@ -637,9 +643,13 @@ mod tests {
     #[test]
     fn effort_follows_the_time_left() {
         let s = Duration::from_secs;
-        assert_eq!([5000, 1000, 999, 240, 239, 0].map(|n| effort_cap(s(n))), [None, None, Some("medium"), Some("medium"), Some("low"), Some("low")]);
-        // the thresholds are ordered, or `low` could never apply
-        assert!(LIMITS.effort_low_below_s < LIMITS.effort_medium_below_s && LIMITS.time_note_pct[0] > LIMITS.time_note_pct[1]);
+        assert_eq!(
+            [5000, 1000, 999, 480, 479, 240, 239, 0].map(|n| effort_cap(s(n))),
+            [None, None, Some("high"), Some("high"), Some("medium"), Some("medium"), Some("low"), Some("low")]
+        );
+        // the thresholds are ordered, or a lower tier could never apply
+        let l = LIMITS;
+        assert!(l.effort_low_below_s < l.effort_medium_below_s && l.effort_medium_below_s < l.effort_high_below_s && l.time_note_pct[0] > l.time_note_pct[1]);
     }
 
     #[test]

@@ -874,7 +874,7 @@ mod tests {
         a.deadline = Some(deadline_in(900, 1000));
         fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
         assert_eq!(a.run_request("look"), Outcome::Done);
-        assert_eq!(m.caps, [Some("medium".to_string()), Some("low".into()), Some("medium".into())]);
+        assert_eq!(m.caps, [Some("high".to_string()), Some("low".into()), Some("high".into())]);
     }
 
     #[test]
