@@ -97,6 +97,8 @@ def parse_trial(trial_dir: Path) -> dict | None:
         status, infra = "infra_error", m["infra_reason"]
     else:
         status, infra = "fail", ""
+    rec = _load_json(trial_dir / "agent" / core.TIMEOUT_FILE)  # what XolotlAgent.run() resolved; {} if it never got that far
+    source = rec.get("source")
     ar = r.get("agent_result") or {}
     if have_jsonl:
         tokens = m["tokens"]
@@ -111,6 +113,7 @@ def parse_trial(trial_dir: Path) -> dict | None:
         "reward": reward, "exception": exc, "infra_reason": infra, "exit_code": exit_code, "tokens": tokens,
         "policy_hash": m["policy_hash"], "metadata": metadata, "agent_time_s": _agent_seconds(r.get("agent_execution")),
         "xolotl_version": (r.get("agent_info") or {}).get("version") or "",
+        "agent_timeout_sec": _num(rec.get("agent_timeout_sec")), "timeout_source": source if isinstance(source, str) else None,
     }
 
 
@@ -214,10 +217,11 @@ def _git(*args: str) -> str:
 def _print_summary(result: dict, path: Path) -> None:
     s = result["summary"]
     width = max((len(t["task"]) for t in result["trials"]), default=4)
-    print(f"\n{'task':<{width}}  status       reward  agent time  tokens in/out")
+    print(f"\n{'task':<{width}}  status       reward  agent time  limit  tokens in/out")
     for t in result["trials"]:
         agent_s = "-" if t["agent_time_s"] is None else f"{t['agent_time_s']:.0f}s"
-        print(f"{t['task']:<{width}}  {t['status']:<11}  {t['reward']!s:<6}  {agent_s:<10}  "
+        limit = "-" if t["agent_timeout_sec"] is None else f"{t['agent_timeout_sec']:.0f}s"
+        print(f"{t['task']:<{width}}  {t['status']:<11}  {t['reward']!s:<6}  {agent_s:<10}  {limit:<5}  "
               f"{t['tokens']['prompt']}/{t['tokens']['completion']}"
               + (f"  ({t['infra_reason']})" if t["infra_reason"] else ""))
     ran = s["total"] - s["infra"]
@@ -226,6 +230,10 @@ def _print_summary(result: dict, path: Path) -> None:
           f"median agent time {s['median_agent_time_s']:.1f}s")
     if s["infra"]:
         print(f"WARNING: {s['infra']} trial(s) are infra_error and excluded from the pass rate; re-run them before trusting this row")
+    fallback = sum(t["timeout_source"] == "default" for t in result["trials"])
+    if fallback:
+        print(f"WARNING: {fallback} trial(s) used the {core.DEFAULT_TIMEOUT_S} s default timeout because the task's task.toml was "
+              "not found; their budget may be shorter than the task's real limit")
     print(f"results: {path}")
 
 

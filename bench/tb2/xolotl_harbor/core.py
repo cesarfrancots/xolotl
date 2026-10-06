@@ -5,13 +5,17 @@ interpreter can't import the `bench` package without path hacks); test_tb2 asser
 """
 import base64
 import json
+import math
 import os
 import shlex
 import subprocess
+import tomllib
 from collections.abc import Iterable, Iterator
+from pathlib import Path
 
 DEFAULT_MODEL = "glm-5.3-flash"
-DEFAULT_TIMEOUT_S = 900  # TB2's usual agent timeout; Harbor doesn't tell the agent the task's own value
+DEFAULT_TIMEOUT_S = 900  # TB2's usual agent timeout; only used when the task's own task.toml can't be found
+TIMEOUT_FILE = "agent_timeout.json"  # in <trial>/agent/: the timeout resolve_timeout() chose for that trial
 BINARY = "/installed-agent/xolotl"
 LOGS = "/logs/agent"
 KEY_ENV = "ZAI_API_KEY"
@@ -26,6 +30,38 @@ def timeout_budget(agent_timeout_sec: float | None) -> int:
     """Seconds Xolotl may run: the task's agent timeout minus 60 s, at least 60, so it stops before Harbor kills the
     container and the logs still get copied."""
     return max(60, int(agent_timeout_sec if agent_timeout_sec is not None else DEFAULT_TIMEOUT_S) - 60)
+
+
+def _positive(v: object) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 else None
+
+
+def task_agent_timeout(environment_dir: Path | str) -> float | None:
+    """`[agent].timeout_sec` of the task that owns this `environment/` folder, or None if it can't be read. Harbor tells
+    an agent nothing about its task's timeout, but it hands run() an environment whose `environment_dir` is
+    <task>/environment (trial.py: `environment_dir=self.task.paths.environment_dir`), and task.toml sits next to it."""
+    try:
+        with (Path(environment_dir).parent / "task.toml").open("rb") as f:
+            return _positive(tomllib.load(f)["agent"]["timeout_sec"])
+    except (OSError, ValueError, KeyError, TypeError):  # missing, garbled (TOMLDecodeError is a ValueError), no [agent]
+        return None
+
+
+def resolve_timeout(override: object, environment_dir: Path | str | None) -> dict:
+    """The agent timeout for one trial: an explicit `--ak agent_timeout_sec=N` wins, else the task's own task.toml, else
+    DEFAULT_TIMEOUT_S (source "default", which the wrapper flags). Also the Xolotl budget derived from it. A bad
+    override raises ValueError rather than silently falling back.
+    ponytail: Harbor's own `--agent-timeout-multiplier`/`--agent-timeout` overrides aren't visible here; if you use them,
+    pass the resulting number as `--ak agent_timeout_sec=N`."""
+    if override is not None:
+        sec, source = _positive(override), "kwarg"
+        if sec is None:
+            raise ValueError(f"agent_timeout_sec must be a positive number, got {override!r}")
+    else:
+        sec, source = (task_agent_timeout(environment_dir) if environment_dir is not None else None), "task.toml"
+        if sec is None:
+            sec, source = DEFAULT_TIMEOUT_S, "default"
+    return {"agent_timeout_sec": sec, "source": source, "budget_s": timeout_budget(sec)}
 
 
 def run_command(instruction: str, model: str, timeout_s: int) -> str:

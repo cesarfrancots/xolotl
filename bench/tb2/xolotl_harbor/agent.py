@@ -4,6 +4,7 @@ Importable as `xolotl_harbor.agent:XolotlAgent` once bench/tb2 is on Harbor's PY
 binary is built by build_linux.py and uploaded in install(); tokens come from the JSON-lines stream Xolotl writes to
 /logs/agent, which Harbor maps to <trial>/agent/ on the host.
 """
+import json
 import os
 from pathlib import Path
 
@@ -19,7 +20,9 @@ class XolotlAgent(BaseInstalledAgent):
         # `binary` and `agent_timeout_sec` arrive as `--ak binary=... --ak agent_timeout_sec=...`; never the API key.
         super().__init__(*args, **kwargs)
         self._binary = binary
-        self._agent_timeout_sec = agent_timeout_sec  # Harbor doesn't tell an agent its task's timeout; default 900 s
+        self._agent_timeout_sec = agent_timeout_sec  # optional override; normally run() reads the task's own timeout
+        if agent_timeout_sec is not None:
+            core.resolve_timeout(agent_timeout_sec, None)  # a typo'd override fails now, not after the container is up
 
     @staticmethod
     def name() -> str:
@@ -40,7 +43,13 @@ class XolotlAgent(BaseInstalledAgent):
         key = core.read_api_key()
         if not key:
             raise RuntimeError(f"{core.KEY_ENV} is not set (process env or Windows User scope)")
-        cmd = core.run_command(instruction, core.model_arg(self.model_name), core.timeout_budget(self._agent_timeout_sec))
+        # The task's own agent timeout (read from its task.toml; Harbor doesn't pass it) minus 60 s, so Xolotl stops first.
+        rec = core.resolve_timeout(self._agent_timeout_sec, environment.environment_dir)
+        try:  # which timeout this trial really got; run.py puts it in the results. Losing it must not lose the trial.
+            (self.logs_dir / core.TIMEOUT_FILE).write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        except OSError as e:
+            self.logger.warning(f"could not record {core.TIMEOUT_FILE}: {e}")
+        cmd = core.run_command(instruction, core.model_arg(self.model_name), rec["budget_s"])
         # The key goes only through env=; the command always exits 0, so the verifier decides pass or fail.
         await self.exec_as_agent(environment, cmd, env={core.KEY_ENV: key})
 
