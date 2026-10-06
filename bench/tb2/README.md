@@ -40,7 +40,7 @@ needed. To call Harbor by hand, set the same variable, e.g. in Git Bash:
 
 ```
 PYTHONPATH=bench/tb2 harbor run -d terminal-bench@2.0 -a xolotl_harbor.agent:XolotlAgent -m zai/glm-5.3-flash \
-  --ak binary=target/x86_64-unknown-linux-musl/release/xolotl -i fix-git
+  --ak binary=target/x86_64-unknown-linux-musl/release/xol -i fix-git
 ```
 
 `XolotlAgent.install()` uploads the binary to `/installed-agent/xolotl` (kwarg `binary`, else env `XOLOTL_LINUX_BIN`);

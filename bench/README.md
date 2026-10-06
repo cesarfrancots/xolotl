@@ -10,7 +10,7 @@ Git Bash is the primary platform. Run everything from the repo root.
 py bench/run.py --selfcheck                          # no model calls: every task must be solvable and not already solved
 py bench/run.py --repeat 3 --note "v1 baseline"      # full suite, 3 attempts per task (builds with cargo first)
 py bench/run.py --tasks py-offbyone --keep           # one task; --keep leaves each attempt's temp dir behind
-py bench/run.py --xolotl path\to\xolotl.exe          # use a ready binary instead of building (a .py file works too)
+py bench/run.py --xolotl path\to\xol.exe             # use a ready binary instead of building (a .py file works too)
 py bench/run.py --fingerprint                        # print each task's hash and the suite hash; no build, no model calls
 py -m unittest bench.test_run -v                     # tests for the runner itself
 ```
