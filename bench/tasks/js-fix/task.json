@@ -1,0 +1,11 @@
+{
+  "id": "js-fix",
+  "title": "Fix formatDuration in a Node module",
+  "tags": ["node", "bugfix"],
+  "prompt": "formatDuration in dates.js returns wrong results for some inputs. Fix it; the expected format is described in its doc comment.",
+  "verify": ["node verify/check.js"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": ["node"]
+}

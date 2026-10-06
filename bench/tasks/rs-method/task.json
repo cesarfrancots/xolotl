@@ -1,0 +1,11 @@
+{
+  "id": "rs-method",
+  "title": "Add a peek method to a Rust stack, with a test",
+  "tags": ["rust", "feature"],
+  "prompt": "Add a peek(&self) -> Option<&T> method to Stack that returns the top element without removing it, and add a unit test for it.",
+  "verify": ["{python} verify/check.py"],
+  "timeout_s": 600,
+  "verify_timeout_s": 240,
+  "budget": null,
+  "requires": ["cargo"]
+}

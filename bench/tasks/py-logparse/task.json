@@ -1,0 +1,11 @@
+{
+  "id": "py-logparse",
+  "title": "Summarize an access log into JSON",
+  "tags": ["python", "data"],
+  "prompt": "Write summarize.py that reads access.log and writes summary.json containing: \"total\" (number of requests), \"by_status\" (object mapping each HTTP status code as a string to its count) and \"top_paths\" (list of the 3 most requested paths as [path, count] pairs, most requested first, ties broken alphabetically). Run it once.",
+  "verify": ["{python} -m unittest discover -s verify -v"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}

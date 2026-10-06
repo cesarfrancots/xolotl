@@ -1,0 +1,11 @@
+{
+  "id": "env-tool",
+  "title": "Write a script that hashes the files in data/",
+  "tags": ["environment", "scripting"],
+  "prompt": "Write a script named report.py or report.sh (your choice) that prints one line per .txt file in data/, sorted by file name, formatted as \"<sha256 hex>  <file name>\" (two spaces). Run it once to show the output.",
+  "verify": ["{python} verify/check.py"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}

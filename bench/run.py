@@ -1,0 +1,595 @@
+"""Xolotl bench runner: runs Xolotl headless on a task suite and records pass rate, tokens and timing.
+
+Standard library only. The pure helpers come first; orchestration (run_attempt, selfcheck, main) lives below them.
+"""
+import argparse
+import hashlib
+import itertools
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from collections.abc import Iterable, Iterator
+from datetime import datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Header + separator of results/HISTORY.md. Ends with a newline so a row can be appended straight after it.
+HISTORY_HEADER = (
+    "| Date | Run | Policy | Tasks | Pass | Tokens (prompt / completion) | Median wall | Note |\n"
+    "|---|---|---|---|---|---|---|---|\n"
+)
+
+
+def slug(path: str) -> str:
+    """Same rule as Rust `store::project_slug`: anything but ASCII alphanumerics, '-', '_' and '.' becomes '-'."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", path)
+
+
+def _is_int(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _str_list(v: object) -> bool:
+    return isinstance(v, list) and all(isinstance(x, str) and x.strip() for x in v)
+
+
+def load_task(task_dir: Path) -> dict:
+    """Read and validate task.json, filling defaults. Raises ValueError naming the missing or bad field."""
+    def bad(msg: str) -> ValueError:
+        return ValueError(f"task {task_dir.name}: {msg}")
+
+    try:
+        raw = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        raise bad(f"cannot read task.json: {e}") from e
+    if not isinstance(raw, dict):
+        raise bad("task.json must be a JSON object")
+    t = {"tags": [], "requires": [], "timeout_s": 600, "verify_timeout_s": 120, "budget": None, **raw}
+    for k in ("id", "title", "prompt"):
+        if not isinstance(t.get(k), str) or not t[k].strip():
+            raise bad(f"field '{k}' is required and must be a non-empty string")
+    if t["id"] != task_dir.name:
+        raise bad(f"field 'id' ({t['id']!r}) must equal the folder name")
+    if not _str_list(t.get("verify")) or not t["verify"]:  # a blank command would pass vacuously
+        raise bad("field 'verify' is required and must be a non-empty list of command strings")
+    for k in ("tags", "requires"):
+        if not _str_list(t[k]):
+            raise bad(f"field '{k}' must be a list of non-empty strings")
+    for k in ("timeout_s", "verify_timeout_s"):
+        if not _is_int(t[k]) or t[k] <= 0:
+            raise bad(f"field '{k}' must be a positive integer")
+    if t["budget"] is not None and (not _is_int(t["budget"]) or t["budget"] <= 0):
+        raise bad("field 'budget' must be a positive integer or null")
+    return t
+
+
+def _events(lines: Iterable[str]) -> Iterator[dict]:
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except (ValueError, RecursionError):  # truncated, binary, or absurdly nested garbage
+            continue
+        if isinstance(ev, dict):
+            yield ev
+
+
+def _count(usage: object, key: str) -> int:
+    v = usage.get(key) if isinstance(usage, dict) else None
+    return v if _is_int(v) else 0
+
+
+def metrics_from_events(lines: Iterable[str]) -> dict:
+    """Metrics for one attempt from Xolotl's JSON-lines event stream. Lines that aren't JSON objects are ignored."""
+    m = {"model_calls": 0, "tool_calls": 0, "tokens": {"prompt": 0, "completion": 0, "cached": 0},
+         "compactions": {"stage1": 0, "stage2": 0}, "completion_check": False, "errors": 0,
+         "policy_hash": "", "interrupted": False}
+    for ev in _events(lines):
+        kind = ev.get("type")
+        if kind == "assistant":
+            m["model_calls"] += 1
+            for k in m["tokens"]:
+                m["tokens"][k] += _count(ev.get("usage"), k)
+        elif kind == "tool_result":
+            m["tool_calls"] += 1
+        elif kind == "compaction" and _is_int(ev.get("stage")) and ev["stage"] in (1, 2):
+            m["compactions"][f"stage{ev['stage']}"] += 1
+        elif kind == "nudge" and ev.get("reason") == "completion_check":
+            m["completion_check"] = True
+        elif kind == "error":
+            m["errors"] += 1
+        elif kind == "interrupt":
+            m["interrupted"] = True
+        elif kind == "session_start" and isinstance(ev.get("policy_hash"), str):
+            m["policy_hash"] = ev["policy_hash"]
+    return m
+
+
+def session_dir(home: Path, cwd: str) -> Path | None:
+    """Newest session folder for `cwd` under <home>/.xolotl/projects/<slug>/sessions, or None."""
+    root = home / ".xolotl" / "projects" / slug(cwd) / "sessions"
+    if not root.is_dir():
+        return None
+    # ponytail: newest = max folder name (ids are UTC YYYYMMDD-HHMMSS-xxxx, as in Rust); two sessions in one second tie on the random suffix.
+    return max((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name, default=None)
+
+
+def summarize(attempts: list[dict]) -> dict:
+    """Run summary. Skipped and infra_error attempts (no session ran, or the model API failed) count in `total` but
+    not in the `pass_rate`, `per_task` or wall-time figures; tokens are summed over every attempt."""
+    ran = [a for a in attempts if a.get("status") not in ("skipped", "infra_error")]
+    infra = sum(1 for a in attempts if a.get("status") == "infra_error")
+    passed = sum(1 for a in ran if a.get("pass"))
+    per: dict[str, list[int]] = {}  # task -> [passes, attempts that ran, infra errors]
+    for a in attempts:
+        counts = per.setdefault(a["task"], [0, 0, 0])
+        if a.get("status") == "infra_error":
+            counts[2] += 1
+        elif a.get("status") != "skipped":
+            counts[0] += bool(a.get("pass"))
+            counts[1] += 1
+    walls = [a["wall_s"] for a in ran if isinstance(a.get("wall_s"), (int, float))]
+    return {
+        "pass": passed,
+        "total": len(attempts),
+        "skipped": len(attempts) - len(ran) - infra,
+        "infra_errors": infra,
+        "pass_rate": round(passed / len(ran), 3) if ran else 0.0,
+        "per_task": {t: f"{p}/{n}" + (f" (+{i} infra)" if i else "") if n or i else "skipped" for t, (p, n, i) in per.items()},
+        "tokens": {k: sum(_count(a.get("tokens"), k) for a in attempts) for k in ("prompt", "completion", "cached")},
+        "median_wall_s": round(statistics.median(walls), 3) if walls else 0.0,
+        "total_wall_s": round(sum(walls), 3),
+    }
+
+
+def history_row(result: dict) -> str:
+    """One HISTORY.md table row (no trailing newline) for a results/<run_id>.json dict."""
+    s = result["summary"]
+    infra = s.get("infra_errors", 0)
+    ran = s["total"] - s["skipped"] - infra
+    cells = [
+        datetime.fromisoformat(result["started"]).strftime("%Y-%m-%d %H:%M"),
+        result["run_id"] + (" (dirty)" if result.get("dirty") else ""),  # built from a modified source tree
+        (result.get("policy_hash") or "")[:8],
+        result.get("tasks_hash") or "",
+        f"{s['pass']}/{ran} ({s['pass_rate'] * 100:.1f}%)" + (f" ⚠{infra} infra" if infra else ""),
+        f"{s['tokens']['prompt']} / {s['tokens']['completion']}",
+        f"{s['median_wall_s']:.1f}s",
+        (result.get("note") or "").replace("|", "\\|").replace("\n", " "),  # a note must not break the table
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def task_hash(task_dir: Path) -> str:
+    """Fingerprint (12 hex) of what a task shows the agent and what decides it: task.json, repo/ and verify/, each
+    file by relative path and content. solution/ and __pycache__ are left out; CRLF reads as LF so a Windows
+    checkout (autocrlf) can't change it."""
+    files = [task_dir / "task.json"]
+    for d in ("repo", "verify"):
+        if (task_dir / d).is_dir():
+            files += [p for p in (task_dir / d).rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+    h = hashlib.sha256()
+    for rel, p in sorted((p.relative_to(task_dir).as_posix(), p) for p in files):
+        data = p.read_bytes().replace(b"\r\n", b"\n")
+        h.update(f"{rel}\0{len(data)}\0".encode() + data)  # the length keeps one file's end from sliding into the next
+    return h.hexdigest()[:12]
+
+
+def suite_hash(hashes: dict[str, str]) -> str:
+    """Fingerprint (12 hex) of a set of tasks, from their ids and task_hash values."""
+    return hashlib.sha256("\n".join(f"{t}:{h}" for t, h in sorted(hashes.items())).encode()).hexdigest()[:12]
+
+
+# ---- orchestration ---------------------------------------------------------------------------------------------
+
+
+def find_bash() -> list[str]:
+    """Argv prefix for running a verify command through a shell."""
+    if os.name != "nt":
+        return ["bash"]
+    # Git for Windows' bash, found from `git` (never System32\bash.exe, the WSL stub). git.exe lives in <Git>\cmd or
+    # <Git>\bin, or in <Git>\mingw64\bin when PATH comes from Git Bash: <Git> is parents[1] or parents[2].
+    git = shutil.which("git")
+    for root in Path(git).parents[1:3] if git else []:
+        if (root / "bin" / "bash.exe").is_file():
+            return [str(root / "bin" / "bash.exe")]
+    return ["cmd", "/c"]
+
+
+def _rm(path: Path) -> None:
+    """Delete a file or a tree. Git's read-only object files would make a plain rmtree fail on Windows."""
+    def writable(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, **{"onexc" if sys.version_info >= (3, 12) else "onerror": writable})
+    elif path.is_symlink() or path.exists():
+        path.unlink()
+
+
+def _pump(stream, buf: bytearray) -> None:
+    for chunk in iter(lambda: stream.read1(65536), b""):
+        buf += chunk
+
+
+def _join(threads: list[threading.Thread], timeout: float) -> None:
+    end = time.monotonic() + timeout
+    for t in threads:
+        t.join(max(0.0, end - time.monotonic()))
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)  # it leads its own session, so pgid == pid even once reaped
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_tree(argv: list[str] | str, cwd: str | Path | None, timeout: float) -> tuple[int | None, bytes, bytes, bool]:
+    """Run `argv` with stdout and stderr drained on threads (a full pipe can't block the child) and kill its whole
+    process tree after `timeout` seconds. Returns (exit code, stdout, stderr, timed_out)."""
+    # ponytail: no Windows Job Object, so a grandchild that outlives a child which exited on its own is not killed
+    # (readers just give up on it after 3 s); upgrade path: assign the child to a Job Object with KILL_ON_JOB_CLOSE.
+    flags = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **flags)
+    out, err = bytearray(), bytearray()
+    readers = [threading.Thread(target=_pump, args=(s, b), daemon=True) for s, b in ((proc.stdout, out), (proc.stderr, err))]
+    for t in readers:
+        t.start()
+    try:
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None and time.monotonic() < deadline:  # poll, not wait(): stays interruptible by Ctrl+C
+            time.sleep(0.05)
+        timed_out = proc.poll() is None
+        if not timed_out:
+            _join(readers, 3)
+        if timed_out or any(t.is_alive() for t in readers):  # on timeout, or when something still holds the pipes
+            _kill_tree(proc)
+        _join(readers, 3)  # short: an orphan holding a pipe must not hang the runner
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+    except BaseException:  # Ctrl+C included: never leave the child tree running
+        _kill_tree(proc)
+        raise
+    finally:
+        for stream, t in zip((proc.stdout, proc.stderr), readers):
+            if not t.is_alive():  # a reader still blocked on an orphan's pipe must not have it closed under it
+                stream.close()
+    return proc.returncode, bytes(out), bytes(err), timed_out
+
+
+def _verify(task: dict, task_dir: Path, work: Path) -> tuple[bool, str]:
+    """Put the real hidden checks in work/verify (replacing anything already there), run every verify command in
+    `work`, stop at the first failure. Returns (all passed, last 2 KB of output)."""
+    _rm(work / "verify")
+    shutil.copytree(task_dir / "verify", work / "verify")
+    shell = find_bash()
+    py = f'"{sys.executable}"' if shell[0] == "cmd" else shlex.quote(sys.executable)
+    out, ok = b"", True
+    for cmd in task["verify"]:
+        cmd = cmd.replace("{python}", py)
+        argv = f'cmd /c "{cmd}"' if shell[0] == "cmd" else [*shell, "-c", cmd]
+        rc, o, e, timed_out = _run_tree(argv, work, task["verify_timeout_s"])
+        out += o + e
+        if timed_out:
+            out += f"\n[verify timed out after {task['verify_timeout_s']}s]\n".encode()
+        ok = rc == 0 and not timed_out
+        if not ok:
+            break
+    return ok, out[-2048:].decode("utf-8", errors="replace")
+
+
+def _init_repo(path: str) -> None:
+    """git init plus one commit, so the agent has a repository to work in."""
+    commit = ["-c", "user.name=bench", "-c", "user.email=bench@local", "-c", "commit.gpgsign=false",
+              "commit", "-q", "--allow-empty", "-m", "init"]
+    for args in (["init", "-q"], ["add", "-A"], commit):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True, stdin=subprocess.DEVNULL)
+
+
+def _infra_reason(events: list[dict]) -> str:
+    """Why an attempt says nothing about the agent, or "": no session ever started (e.g. the API key variable is
+    unset), or the model API failed for good (quota, auth, network, HTTP). Not infra: an `llm` error marked retry,
+    which is a context overflow the agent compacted away and retried, and a repeated overflow, which is the agent's
+    own context management failing (messages as in llm.rs `LlmError`'s Display)."""
+    if not any(e.get("type") == "session_start" for e in events):
+        return "no session_start event"
+    for e in events:
+        if e.get("type") == "error" and e.get("kind") == "llm" and e.get("retry") is not True:
+            msg = str(e.get("message", ""))
+            if not msg.startswith("context window exceeded"):
+                return f"llm error: {msg[:200]}"
+    return ""
+
+
+def run_attempt(task: dict, task_dir: Path, xolotl_cmd: list[str], home: Path,
+                budget: int | None, keep: bool, attempt: int = 1) -> dict:
+    """One attempt: fresh git-initialised copy of repo/, run Xolotl on it, replace verify/ with the real one, verify,
+    collect metrics. The temp dir is deleted only if the attempt passed and `keep` is off. Status: `pass`, `fail`,
+    `skipped` (a toolchain is missing) or `infra_error` (see _infra_reason; only for an attempt that didn't pass)."""
+    missing = [r for r in task["requires"] if shutil.which(r) is None]
+    base = {"task": task["id"], "attempt": attempt, "task_hash": task_hash(task_dir)}
+    if missing:
+        return {**base, "status": "skipped", "pass": False, "exit_code": None, "timed_out": False, "wall_s": 0.0,
+                "verify_output": f"missing toolchain: {', '.join(missing)}", "stderr_tail": "", "infra_reason": "",
+                "kept_dir": None, "session_dir": None, "model": "", **metrics_from_events([])}
+
+    tmp = tempfile.mkdtemp(prefix="xolotl-bench-")  # the same string goes to --cwd and session_dir (slug parity)
+    try:
+        shutil.copytree(task_dir / "repo", tmp, dirs_exist_ok=True)
+        _init_repo(tmp)
+        argv = [*xolotl_cmd, "-p", task["prompt"], "--mode", "yolo", "--cwd", tmp]
+        budget = task["budget"] if task["budget"] is not None else budget
+        if budget is not None:
+            argv += ["--budget", str(budget)]
+        t0 = time.monotonic()
+        exit_code, stdout, stderr, timed_out = _run_tree(argv, None, task["timeout_s"])
+        wall_s = round(time.monotonic() - t0, 3)
+
+        ok, verify_output = _verify(task, task_dir, Path(tmp))
+        try:  # the hidden checks must not stay in a kept dir, where a later attempt's agent could find them
+            _rm(Path(tmp) / "verify")
+        except OSError:
+            pass
+        lines = stdout.decode("utf-8", errors="replace").split("\n")  # not splitlines(): U+2028 may sit inside a JSON string
+        events = list(_events(lines))
+        model = next((e["model"] for e in events if e.get("type") == "session_start" and isinstance(e.get("model"), str)), "")
+        infra = "" if ok else _infra_reason(events)  # a measured pass stays a pass
+        sd = session_dir(home, tmp)
+        kept = tmp
+        if ok and not keep:
+            try:
+                _rm(Path(tmp))
+                kept = None
+            except OSError:  # locked by a straggler process: the dir is still there, so report it
+                pass
+    except BaseException:  # includes Ctrl+C: the attempt is dropped, so don't leave its dir behind
+        try:
+            _rm(Path(tmp))
+        except OSError:  # e.g. a dying child still holds the dir; that must not replace the exception being handled
+            pass
+        raise
+    return {**base, "status": "pass" if ok else "infra_error" if infra else "fail", "pass": ok, "exit_code": exit_code,
+            "timed_out": timed_out, "wall_s": wall_s, "verify_output": verify_output,
+            "stderr_tail": stderr[-1024:].decode("utf-8", errors="replace"), "infra_reason": infra,
+            "kept_dir": kept, "session_dir": str(sd) if sd else None, "model": model, **metrics_from_events(lines)}
+
+
+def _last_lines(text: str, n: int = 3, limit: int = 300) -> str:
+    return " | ".join([ln.strip() for ln in text.splitlines() if ln.strip()][-n:])[-limit:]
+
+
+def selfcheck(task: dict, task_dir: Path) -> tuple[bool, str]:
+    """No model calls: the reference solution must pass the hidden checks, and the untouched repo must fail them."""
+    missing = [r for r in task["requires"] if shutil.which(r) is None]
+    if missing:
+        return True, f"skipped, missing toolchain: {', '.join(missing)}"
+    for d in ("repo", "verify", "solution"):
+        if not (task_dir / d).is_dir():
+            return False, f"missing {d}/ directory"
+    with tempfile.TemporaryDirectory(prefix="xolotl-selfcheck-") as tmp:
+        solved, unsolved = Path(tmp) / "solved", Path(tmp) / "unsolved"
+        shutil.copytree(task_dir / "repo", solved)
+        shutil.copytree(task_dir / "solution", solved, dirs_exist_ok=True)
+        ok, output = _verify(task, task_dir, solved)
+        if not ok:
+            return False, f"solution fails verify: {_last_lines(output)}"
+        shutil.copytree(task_dir / "repo", unsolved)
+        if _verify(task, task_dir, unsolved)[0]:
+            return False, "unsolved repo already passes"
+    return True, "solution passes, unsolved repo fails"
+
+
+def _positive(s: str) -> int:
+    if not s.isdigit() or int(s) <= 0:
+        raise argparse.ArgumentTypeError(f"{s!r} is not a positive integer")
+    return int(s)
+
+
+def _parser() -> argparse.ArgumentParser:
+    here = Path(__file__).resolve().parent
+    p = argparse.ArgumentParser(prog="run.py", description="Run Xolotl on the bench task suite.")
+    p.add_argument("--tasks", help="comma-separated task ids (default: all)")
+    p.add_argument("--repeat", type=_positive, default=1, help="attempts per task (default 1)")
+    p.add_argument("--budget", type=_positive, help="--budget passed to Xolotl; a task's own budget wins")
+    p.add_argument("--xolotl", help="Xolotl executable, or a .py stand-in (default: build this source tree)")
+    p.add_argument("--note", default="", help="free text recorded in the results and HISTORY.md")
+    p.add_argument("--keep", action="store_true", help="keep every attempt's temp dir, not only failed ones")
+    p.add_argument("--selfcheck", action="store_true", help="check each task is solvable and not already solved (no model calls)")
+    p.add_argument("--fingerprint", action="store_true", help="print each selected task's hash and the suite hash, then exit")
+    p.add_argument("--tasks-dir", type=Path, default=here / "tasks", help="default: bench/tasks")
+    p.add_argument("--results-dir", type=Path, default=here / "results", help=argparse.SUPPRESS)
+    p.add_argument("--home", type=Path, help=argparse.SUPPRESS)  # where ~/.xolotl is; tests point it at a temp dir
+    return p
+
+
+def _git(*args: str) -> str:
+    """Stdout of a git command in the repo root, or "" if it fails."""
+    try:
+        r = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.decode("utf-8", errors="replace").strip() if r.returncode == 0 else ""
+
+
+def _xolotl_config(home: Path) -> dict | None:
+    """The parsed <home>/.xolotl/config.json, or None if it is absent or unreadable. It can't hold a secret: Xolotl
+    rejects unknown fields and takes the API key from an environment variable, which the runner never reads."""
+    try:
+        cfg = json.loads((home / ".xolotl" / "config.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return cfg if isinstance(cfg, dict) else None
+
+
+def _dirty() -> bool:
+    """Uncommitted changes in the source tree, not counting bench/results/ (earlier runs write there)."""
+    return bool(_git("status", "--porcelain", "--", ".", ":(exclude)bench/results"))
+
+
+def _print_summary(result: dict, path: Path) -> None:
+    s = result["summary"]
+    width = max((len(t) for t in s["per_task"]), default=4)
+    print(f"\n{'task':<{width}}  result")
+    for t, r in s["per_task"].items():
+        print(f"{t:<{width}}  {r}")
+    t = s["tokens"]
+    ran = s["total"] - s["skipped"] - s["infra_errors"]
+    print(f"\n{s['pass']}/{ran} passed ({s['pass_rate'] * 100:.1f}%), {s['skipped']} skipped; "
+          f"tokens {t['prompt']} prompt / {t['completion']} completion ({t['cached']} cached); "
+          f"median {s['median_wall_s']:.1f}s, total {s['total_wall_s']:.1f}s")
+    if s["infra_errors"]:
+        print(f"WARNING: {s['infra_errors']} attempt(s) hit infra errors (no session started, or the model API failed) "
+              "and are excluded from the pass rate; see infra_reason and stderr_tail in the results")
+    print(f"results: {path}")
+
+
+def main(argv: list[str]) -> int:
+    args = _parser().parse_args(argv)
+    if not args.tasks_dir.is_dir():
+        print(f"error: tasks dir not found: {args.tasks_dir}", file=sys.stderr)
+        return 2
+    names = [n for n in args.tasks.split(",") if n] if args.tasks else sorted(p.name for p in args.tasks_dir.iterdir() if p.is_dir())
+    try:
+        tasks = [(load_task(args.tasks_dir / n), args.tasks_dir / n) for n in names]
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if not tasks:
+        print(f"error: no tasks in {args.tasks_dir}", file=sys.stderr)
+        return 2
+
+    hashes = {task["id"]: task_hash(task_dir) for task, task_dir in tasks}
+    if args.fingerprint:
+        width = max(len(t) for t in [*hashes, "tasks_hash"])
+        for t, h in hashes.items():
+            print(f"{t:<{width}}  {h}")
+        print(f"{'tasks_hash':<{width}}  {suite_hash(hashes)}")
+        return 0
+
+    if args.selfcheck:
+        failed = 0
+        for task, task_dir in tasks:
+            ok, reason = selfcheck(task, task_dir)
+            failed += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {task['id']}: {reason}")
+        return 1 if failed else 0
+
+    bin_dir = None
+    try:
+        if args.xolotl:
+            cmd = [sys.executable, args.xolotl] if args.xolotl.endswith(".py") else [args.xolotl]
+        else:
+            print("building: cargo build --release", flush=True)
+            try:
+                built = subprocess.run(["cargo", "build", "--release"], cwd=REPO_ROOT).returncode == 0
+            except OSError as e:
+                print(f"error: cannot run cargo: {e}", file=sys.stderr)
+                return 1
+            if not built:
+                print("error: cargo build failed", file=sys.stderr)
+                return 1
+            try:
+                bin_dir = tempfile.mkdtemp(prefix="xolotl-bin-")  # a copy, so a later rebuild can't hit a locked .exe
+                cmd = [shutil.copy2(REPO_ROOT / "target" / "release" / ("xolotl.exe" if os.name == "nt" else "xolotl"), bin_dir)]
+            except OSError as e:
+                print(f"error: cannot copy the built xolotl: {e}", file=sys.stderr)
+                return 1
+
+        try:
+            v = subprocess.run([*cmd, "--version"], capture_output=True, stdin=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"error: cannot run xolotl: {e}", file=sys.stderr)
+            return 1
+        if v.returncode != 0:
+            print(f"error: `xolotl --version` exited with {v.returncode}", file=sys.stderr)
+            return 1
+
+        started = datetime.now().astimezone()
+        sha = _git("rev-parse", "HEAD") or "unknown"
+        dirty = _dirty()  # sampled now, with the sha: the attempts must not change what the run is labelled with
+        home = args.home or Path.home()
+        config = _xolotl_config(home)
+        run_id = f"{started:%Y%m%d-%H%M}-{sha[:7]}"
+        total = len(tasks) * args.repeat
+        attempts: list[dict] = []
+        exit_code, error, where = 0, "", ""
+        try:
+            for task, task_dir in tasks:
+                for i in range(1, args.repeat + 1):
+                    where = f"{task['id']} #{i}"
+                    a = run_attempt(task, task_dir, cmd, home, args.budget, args.keep, i)
+                    attempts.append(a)
+                    note = (f" ({a['verify_output']})" if a["status"] == "skipped" else
+                            f" ({a['infra_reason']})" if a["status"] == "infra_error" else
+                            " (timed out)" if a["timed_out"] else "")
+                    print(f"[{len(attempts)}/{total}] {where}: {a['status']:<11} {a['wall_s']:7.1f}s  "
+                          f"{a['model_calls']} model calls{note}", flush=True)
+        except KeyboardInterrupt:
+            exit_code = 130
+            print("\ninterrupted: writing partial results", flush=True)
+        except Exception as e:  # any attempt-level failure must not discard the attempts that already finished
+            exit_code, error = 1, f"{where}: {type(e).__name__}: {e}"
+            traceback.print_exc()
+            print(f"error: attempt {where} failed; writing partial results", file=sys.stderr)
+        partial = exit_code != 0
+
+        result = {
+            "run_id": run_id, "started": started.isoformat(timespec="seconds"), "git_sha": sha, "dirty": dirty,
+            "xolotl_version": v.stdout.decode("utf-8", errors="replace").strip(),
+            "xolotl_source": args.xolotl or "built", "xolotl_config": config,
+            "model": next((a["model"] for a in attempts if a["model"]), ""),
+            "policy_hash": next((a["policy_hash"] for a in attempts if a["policy_hash"]), ""),
+            "tasks_hash": suite_hash(hashes),
+            "repeat": args.repeat, "budget": args.budget, "note": args.note, "partial": partial,
+            **({"error": error} if error else {}),
+            "attempts": attempts, "summary": summarize(attempts),
+        }
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+        for n in itertools.count(1):  # exclusive create: never overwrite an earlier run's file, suffix -2, -3 instead
+            result["run_id"] = run_id if n == 1 else f"{run_id}-{n}"
+            path = args.results_dir / f"{result['run_id']}.json"
+            try:
+                with path.open("x", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps(result, indent=2) + "\n")
+                break
+            except FileExistsError:
+                continue
+        if not partial:
+            history = args.results_dir / "HISTORY.md"
+            header = HISTORY_HEADER if not history.exists() or history.stat().st_size == 0 else ""
+            with history.open("a", encoding="utf-8", newline="\n") as f:
+                f.write(header + history_row(result) + "\n")
+        _print_summary(result, path)
+        return exit_code
+    finally:
+        if bin_dir:
+            shutil.rmtree(bin_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="replace")  # verify output may hold characters the console codepage can't print
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,11 @@
+{
+  "id": "py-docstring",
+  "title": "Implement a function from its docstring",
+  "tags": ["python", "implement"],
+  "prompt": "Implement slugify in text_utils.py exactly as its docstring describes.",
+  "verify": ["{python} -m unittest discover -s verify -v"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}

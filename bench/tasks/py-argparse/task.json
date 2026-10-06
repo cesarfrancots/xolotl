@@ -1,0 +1,11 @@
+{
+  "id": "py-argparse",
+  "title": "Add a validated CLI option",
+  "tags": ["python", "feature"],
+  "prompt": "Add a --limit N option to top.py that prints only the top N rows. N must be a positive integer; reject invalid values with a non-zero exit code.",
+  "verify": ["{python} -m unittest discover -s verify -v"],
+  "timeout_s": 600,
+  "verify_timeout_s": 120,
+  "budget": null,
+  "requires": []
+}

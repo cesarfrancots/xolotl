@@ -1,0 +1,1088 @@
+{
+  "run_id": "20261004-1552-24ed0aa",
+  "started": "2026-10-04T15:52:34-06:00",
+  "git_sha": "24ed0aa6259fb2249e505f9c23aec72d258094c8",
+  "dirty": false,
+  "xolotl_version": "xolotl 0.1.0",
+  "model": "glm-5.3-flash",
+  "policy_hash": "e381398ffa98e555",
+  "repeat": 3,
+  "budget": null,
+  "note": "v1 baseline",
+  "partial": false,
+  "attempts": [
+    {
+      "task": "env-tool",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 89.067,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-sue66bhc\\sessions\\20261004-215236-328b\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-sue66bhc\\sessions\\20261004-215236-328b",
+      "model": "glm-5.3-flash",
+      "model_calls": 11,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 37841,
+        "completion": 2321,
+        "cached": 32448
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "env-tool",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 48.207,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-3gouow4x\\sessions\\20261004-215406-fa58\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-3gouow4x\\sessions\\20261004-215406-fa58",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 5,
+      "tokens": {
+        "prompt": 19054,
+        "completion": 1400,
+        "cached": 14592
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "env-tool",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 40.291,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-4t7r30pf\\sessions\\20261004-215454-5983\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-4t7r30pf\\sessions\\20261004-215454-5983",
+      "model": "glm-5.3-flash",
+      "model_calls": 6,
+      "tool_calls": 5,
+      "tokens": {
+        "prompt": 13742,
+        "completion": 813,
+        "cached": 10176
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "js-fix",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 38.644,
+      "verify_output": "ok\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-0ry063pd\\sessions\\20261004-215535-e43a\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-0ry063pd\\sessions\\20261004-215535-e43a",
+      "model": "glm-5.3-flash",
+      "model_calls": 6,
+      "tool_calls": 5,
+      "tokens": {
+        "prompt": 13540,
+        "completion": 830,
+        "cached": 10048
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "js-fix",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 47.362,
+      "verify_output": "ok\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9id02tq1\\sessions\\20261004-215613-ba0d\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9id02tq1\\sessions\\20261004-215613-ba0d",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 17893,
+        "completion": 1127,
+        "cached": 13760
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "js-fix",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 34.415,
+      "verify_output": "ok\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-lnorzzue\\sessions\\20261004-215701-c42e\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-lnorzzue\\sessions\\20261004-215701-c42e",
+      "model": "glm-5.3-flash",
+      "model_calls": 6,
+      "tool_calls": 4,
+      "tokens": {
+        "prompt": 13787,
+        "completion": 877,
+        "cached": 10304
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "long-context",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 199.486,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vdc5r5cn\\sessions\\20261004-215736-8453\ncompacted: elided old tool output (≤ seq 9)\ncompacted: elided old tool output (≤ seq 11)\ncompacting… (summarizing events 1–22)\ncompacted: summary of events 1–22 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vdc5r5cn\\sessions\\20261004-215736-8453\\summaries\\1.md\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vdc5r5cn\\sessions\\20261004-215736-8453",
+      "model": "glm-5.3-flash",
+      "model_calls": 14,
+      "tool_calls": 23,
+      "tokens": {
+        "prompt": 82277,
+        "completion": 7414,
+        "cached": 35904
+      },
+      "compactions": {
+        "stage1": 2,
+        "stage2": 1
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "long-context",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 327.192,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-x8h91v3i\\sessions\\20261004-220055-ab0b\ncompacting… (summarizing events 1–30)\ncompacted: summary of events 1–30 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-x8h91v3i\\sessions\\20261004-220055-ab0b\\summaries\\1.md\ncompacting… (summarizing events 31–34)\ncompacted: summary of events 31–34 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-x8h91v3i\\sessions\\20261004-220055-ab0b\\summaries\\2.md\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-x8h91v3i\\sessions\\20261004-220055-ab0b",
+      "model": "glm-5.3-flash",
+      "model_calls": 15,
+      "tool_calls": 24,
+      "tokens": {
+        "prompt": 92627,
+        "completion": 11034,
+        "cached": 61760
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 2
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "long-context",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 308.477,
+      "verify_output": "ok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ft1m2aze\\sessions\\20261004-220623-591f\ncompacting… (summarizing events 1–13)\ncompacted: summary of events 1–13 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ft1m2aze\\sessions\\20261004-220623-591f\\summaries\\1.md\ncompacting… (summarizing events 14–22)\ncompacted: summary of events 14–22 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ft1m2aze\\sessions\\20261004-220623-591f\\summaries\\2.md\ncompacting… (summarizing events 23–32)\ncompacted: summary of events 23–32 → C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ft1m2aze\\sessions\\20261004-220623-591f\\summaries\\3.md\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ft1m2aze\\sessions\\20261004-220623-591f",
+      "model": "glm-5.3-flash",
+      "model_calls": 18,
+      "tool_calls": 22,
+      "tokens": {
+        "prompt": 114297,
+        "completion": 6472,
+        "cached": 77312
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 3
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-argparse",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 53.005,
+      "verify_output": "test_fixture_has_eight_distinct_scores (test_argparse.TopHidden.test_fixture_has_eight_distinct_scores) ... ok\r\ntest_invalid_limits_exit_nonzero (test_argparse.TopHidden.test_invalid_limits_exit_nonzero) ... ok\r\ntest_limit_after_path_and_equals_form (test_argparse.TopHidden.test_limit_after_path_and_equals_form) ... ok\r\ntest_limit_larger_than_rows_prints_all (test_argparse.TopHidden.test_limit_larger_than_rows_prints_all) ... ok\r\ntest_limit_one (test_argparse.TopHidden.test_limit_one) ... ok\r\ntest_limit_three (test_argparse.TopHidden.test_limit_three) ... ok\r\ntest_no_flag_prints_all_rows (test_argparse.TopHidden.test_no_flag_prints_all_rows) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.672s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-diyhmzzk\\sessions\\20261004-221132-3189\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-diyhmzzk\\sessions\\20261004-221132-3189",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 8,
+      "tokens": {
+        "prompt": 23736,
+        "completion": 1430,
+        "cached": 19008
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-argparse",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 69.159,
+      "verify_output": "test_fixture_has_eight_distinct_scores (test_argparse.TopHidden.test_fixture_has_eight_distinct_scores) ... ok\r\ntest_invalid_limits_exit_nonzero (test_argparse.TopHidden.test_invalid_limits_exit_nonzero) ... ok\r\ntest_limit_after_path_and_equals_form (test_argparse.TopHidden.test_limit_after_path_and_equals_form) ... ok\r\ntest_limit_larger_than_rows_prints_all (test_argparse.TopHidden.test_limit_larger_than_rows_prints_all) ... ok\r\ntest_limit_one (test_argparse.TopHidden.test_limit_one) ... ok\r\ntest_limit_three (test_argparse.TopHidden.test_limit_three) ... ok\r\ntest_no_flag_prints_all_rows (test_argparse.TopHidden.test_no_flag_prints_all_rows) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.698s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-_59a2ls_\\sessions\\20261004-221226-f281\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-_59a2ls_\\sessions\\20261004-221226-f281",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 7,
+      "tokens": {
+        "prompt": 20271,
+        "completion": 1601,
+        "cached": 15424
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-argparse",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 32.339,
+      "verify_output": "test_fixture_has_eight_distinct_scores (test_argparse.TopHidden.test_fixture_has_eight_distinct_scores) ... ok\r\ntest_invalid_limits_exit_nonzero (test_argparse.TopHidden.test_invalid_limits_exit_nonzero) ... ok\r\ntest_limit_after_path_and_equals_form (test_argparse.TopHidden.test_limit_after_path_and_equals_form) ... ok\r\ntest_limit_larger_than_rows_prints_all (test_argparse.TopHidden.test_limit_larger_than_rows_prints_all) ... ok\r\ntest_limit_one (test_argparse.TopHidden.test_limit_one) ... ok\r\ntest_limit_three (test_argparse.TopHidden.test_limit_three) ... ok\r\ntest_no_flag_prints_all_rows (test_argparse.TopHidden.test_no_flag_prints_all_rows) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.687s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vuoxeae1\\sessions\\20261004-221336-c5c6\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vuoxeae1\\sessions\\20261004-221336-c5c6",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 5,
+      "tokens": {
+        "prompt": 17795,
+        "completion": 1218,
+        "cached": 13952
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-crossmodule",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 53.953,
+      "verify_output": "test_fractions (test_crossmodule.ApplyDiscountHidden.test_fractions) ... ok\r\ntest_default_is_no_discount (test_crossmodule.OrderTotalHidden.test_default_is_no_discount) ... ok\r\ntest_discount_cases (test_crossmodule.OrderTotalHidden.test_discount_cases) ... ok\r\ntest_empty_order (test_crossmodule.OrderTotalHidden.test_empty_order) ... ok\r\ntest_rounds_to_cents (test_crossmodule.OrderTotalHidden.test_rounds_to_cents) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qld_0z4j\\sessions\\20261004-221409-6fb3\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qld_0z4j\\sessions\\20261004-221409-6fb3",
+      "model": "glm-5.3-flash",
+      "model_calls": 8,
+      "tool_calls": 8,
+      "tokens": {
+        "prompt": 20774,
+        "completion": 645,
+        "cached": 16768
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-crossmodule",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 40.523,
+      "verify_output": "test_fractions (test_crossmodule.ApplyDiscountHidden.test_fractions) ... ok\r\ntest_default_is_no_discount (test_crossmodule.OrderTotalHidden.test_default_is_no_discount) ... ok\r\ntest_discount_cases (test_crossmodule.OrderTotalHidden.test_discount_cases) ... ok\r\ntest_empty_order (test_crossmodule.OrderTotalHidden.test_empty_order) ... ok\r\ntest_rounds_to_cents (test_crossmodule.OrderTotalHidden.test_rounds_to_cents) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-e3h3vwgk\\sessions\\20261004-221503-2a77\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-e3h3vwgk\\sessions\\20261004-221503-2a77",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 7,
+      "tokens": {
+        "prompt": 15626,
+        "completion": 525,
+        "cached": 12224
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-crossmodule",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 31.135,
+      "verify_output": "test_fractions (test_crossmodule.ApplyDiscountHidden.test_fractions) ... ok\r\ntest_default_is_no_discount (test_crossmodule.OrderTotalHidden.test_default_is_no_discount) ... ok\r\ntest_discount_cases (test_crossmodule.OrderTotalHidden.test_discount_cases) ... ok\r\ntest_empty_order (test_crossmodule.OrderTotalHidden.test_empty_order) ... ok\r\ntest_rounds_to_cents (test_crossmodule.OrderTotalHidden.test_rounds_to_cents) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-n5v_lhe1\\sessions\\20261004-221544-180e\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-n5v_lhe1\\sessions\\20261004-221544-180e",
+      "model": "glm-5.3-flash",
+      "model_calls": 6,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 13449,
+        "completion": 591,
+        "cached": 11776
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-docstring",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 59.003,
+      "verify_output": "test_cases (test_docstring.SlugifyHidden.test_cases) ... ok\r\ntest_returns_str (test_docstring.SlugifyHidden.test_returns_str) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 2 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-l5grrgxa\\sessions\\20261004-221616-0e47\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-l5grrgxa\\sessions\\20261004-221616-0e47",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 25301,
+        "completion": 1727,
+        "cached": 22016
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-docstring",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 30.384,
+      "verify_output": "test_cases (test_docstring.SlugifyHidden.test_cases) ... ok\r\ntest_returns_str (test_docstring.SlugifyHidden.test_returns_str) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 2 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ixcdauq0\\sessions\\20261004-221715-1ea2\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ixcdauq0\\sessions\\20261004-221715-1ea2",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 7,
+      "tokens": {
+        "prompt": 16865,
+        "completion": 919,
+        "cached": 12928
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-docstring",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 41.03,
+      "verify_output": "test_cases (test_docstring.SlugifyHidden.test_cases) ... ok\r\ntest_returns_str (test_docstring.SlugifyHidden.test_returns_str) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 2 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-dd9yzg25\\sessions\\20261004-221746-1c94\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-dd9yzg25\\sessions\\20261004-221746-1c94",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 17042,
+        "completion": 1211,
+        "cached": 9152
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-logparse",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 39.101,
+      "verify_output": "test_fixture_shape (test_logparse.LogparseHidden.test_fixture_shape) ... ok\r\ntest_summary_of_a_different_log (test_logparse.LogparseHidden.test_summary_of_a_different_log) ... ok\r\ntest_summary_of_access_log (test_logparse.LogparseHidden.test_summary_of_access_log) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 3 tests in 0.085s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-psquoiz2\\sessions\\20261004-221827-2af0\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-psquoiz2\\sessions\\20261004-221827-2af0",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 34328,
+        "completion": 1422,
+        "cached": 27520
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-logparse",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 59.891,
+      "verify_output": "test_fixture_shape (test_logparse.LogparseHidden.test_fixture_shape) ... ok\r\ntest_summary_of_a_different_log (test_logparse.LogparseHidden.test_summary_of_a_different_log) ... ok\r\ntest_summary_of_access_log (test_logparse.LogparseHidden.test_summary_of_access_log) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 3 tests in 0.090s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-rjcf6ubs\\sessions\\20261004-221906-f441\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-rjcf6ubs\\sessions\\20261004-221906-f441",
+      "model": "glm-5.3-flash",
+      "model_calls": 8,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 28701,
+        "completion": 1893,
+        "cached": 24576
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-logparse",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 53.915,
+      "verify_output": "test_fixture_shape (test_logparse.LogparseHidden.test_fixture_shape) ... ok\r\ntest_summary_of_a_different_log (test_logparse.LogparseHidden.test_summary_of_a_different_log) ... ok\r\ntest_summary_of_access_log (test_logparse.LogparseHidden.test_summary_of_access_log) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 3 tests in 0.081s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9z_yxm8i\\sessions\\20261004-222006-a7b5\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9z_yxm8i\\sessions\\20261004-222006-a7b5",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 32019,
+        "completion": 1744,
+        "cached": 26368
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-offbyone",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 26.152,
+      "verify_output": "test_every_window_size_matches_brute_force (test_offbyone.MovingAverageHidden.test_every_window_size_matches_brute_force) ... ok\r\ntest_input_is_not_modified (test_offbyone.MovingAverageHidden.test_input_is_not_modified) ... ok\r\ntest_non_positive_window_raises (test_offbyone.MovingAverageHidden.test_non_positive_window_raises) ... ok\r\ntest_window_equals_length (test_offbyone.MovingAverageHidden.test_window_equals_length) ... ok\r\ntest_window_longer_than_input (test_offbyone.MovingAverageHidden.test_window_longer_than_input) ... ok\r\ntest_window_one_is_identity_as_floats (test_offbyone.MovingAverageHidden.test_window_one_is_identity_as_floats) ... ok\r\ntest_window_two (test_offbyone.MovingAverageHidden.test_window_two) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-b3w9l1l8\\sessions\\20261004-222101-df7e\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-b3w9l1l8\\sessions\\20261004-222101-df7e",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 15661,
+        "completion": 576,
+        "cached": 12352
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-offbyone",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 35.072,
+      "verify_output": "test_every_window_size_matches_brute_force (test_offbyone.MovingAverageHidden.test_every_window_size_matches_brute_force) ... ok\r\ntest_input_is_not_modified (test_offbyone.MovingAverageHidden.test_input_is_not_modified) ... ok\r\ntest_non_positive_window_raises (test_offbyone.MovingAverageHidden.test_non_positive_window_raises) ... ok\r\ntest_window_equals_length (test_offbyone.MovingAverageHidden.test_window_equals_length) ... ok\r\ntest_window_longer_than_input (test_offbyone.MovingAverageHidden.test_window_longer_than_input) ... ok\r\ntest_window_one_is_identity_as_floats (test_offbyone.MovingAverageHidden.test_window_one_is_identity_as_floats) ... ok\r\ntest_window_two (test_offbyone.MovingAverageHidden.test_window_two) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-3pylk2ml\\sessions\\20261004-222127-a149\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-3pylk2ml\\sessions\\20261004-222127-a149",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 16340,
+        "completion": 773,
+        "cached": 12800
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-offbyone",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 30.428,
+      "verify_output": "test_every_window_size_matches_brute_force (test_offbyone.MovingAverageHidden.test_every_window_size_matches_brute_force) ... ok\r\ntest_input_is_not_modified (test_offbyone.MovingAverageHidden.test_input_is_not_modified) ... ok\r\ntest_non_positive_window_raises (test_offbyone.MovingAverageHidden.test_non_positive_window_raises) ... ok\r\ntest_window_equals_length (test_offbyone.MovingAverageHidden.test_window_equals_length) ... ok\r\ntest_window_longer_than_input (test_offbyone.MovingAverageHidden.test_window_longer_than_input) ... ok\r\ntest_window_one_is_identity_as_floats (test_offbyone.MovingAverageHidden.test_window_one_is_identity_as_floats) ... ok\r\ntest_window_two (test_offbyone.MovingAverageHidden.test_window_two) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 7 tests in 0.000s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-rovuo2hk\\sessions\\20261004-222203-8d85\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-rovuo2hk\\sessions\\20261004-222203-8d85",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 6,
+      "tokens": {
+        "prompt": 16174,
+        "completion": 709,
+        "cached": 12736
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-perf",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 98.133,
+      "verify_output": "test_accepts_any_iterable (test_perf.DedupeHidden.test_accepts_any_iterable) ... ok\r\ntest_keeps_first_occurrence_in_order (test_perf.DedupeHidden.test_keeps_first_occurrence_in_order) ... ok\r\ntest_large_input_is_fast_and_correct (test_perf.DedupeHidden.test_large_input_is_fast_and_correct) ... ok\r\ntest_mixed_ints_and_strings (test_perf.DedupeHidden.test_mixed_ints_and_strings) ... ok\r\ntest_returns_a_new_list_and_leaves_input_alone (test_perf.DedupeHidden.test_returns_a_new_list_and_leaves_input_alone) ... ok\r\ntest_trivial_inputs (test_perf.DedupeHidden.test_trivial_inputs) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 6 tests in 0.097s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qnb7iu9t\\sessions\\20261004-222233-df38\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qnb7iu9t\\sessions\\20261004-222233-df38",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 8,
+      "tokens": {
+        "prompt": 22722,
+        "completion": 1819,
+        "cached": 18176
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-perf",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 231.626,
+      "verify_output": "test_accepts_any_iterable (test_perf.DedupeHidden.test_accepts_any_iterable) ... ok\r\ntest_keeps_first_occurrence_in_order (test_perf.DedupeHidden.test_keeps_first_occurrence_in_order) ... ok\r\ntest_large_input_is_fast_and_correct (test_perf.DedupeHidden.test_large_input_is_fast_and_correct) ... ok\r\ntest_mixed_ints_and_strings (test_perf.DedupeHidden.test_mixed_ints_and_strings) ... ok\r\ntest_returns_a_new_list_and_leaves_input_alone (test_perf.DedupeHidden.test_returns_a_new_list_and_leaves_input_alone) ... ok\r\ntest_trivial_inputs (test_perf.DedupeHidden.test_trivial_inputs) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 6 tests in 0.110s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qp9s7_jh\\sessions\\20261004-222412-8d57\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qp9s7_jh\\sessions\\20261004-222412-8d57",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 8,
+      "tokens": {
+        "prompt": 26317,
+        "completion": 2768,
+        "cached": 20992
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-perf",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 93.399,
+      "verify_output": "test_accepts_any_iterable (test_perf.DedupeHidden.test_accepts_any_iterable) ... ok\r\ntest_keeps_first_occurrence_in_order (test_perf.DedupeHidden.test_keeps_first_occurrence_in_order) ... ok\r\ntest_large_input_is_fast_and_correct (test_perf.DedupeHidden.test_large_input_is_fast_and_correct) ... ok\r\ntest_mixed_ints_and_strings (test_perf.DedupeHidden.test_mixed_ints_and_strings) ... ok\r\ntest_returns_a_new_list_and_leaves_input_alone (test_perf.DedupeHidden.test_returns_a_new_list_and_leaves_input_alone) ... ok\r\ntest_trivial_inputs (test_perf.DedupeHidden.test_trivial_inputs) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 6 tests in 0.185s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-75he6mx2\\sessions\\20261004-222804-a7fa\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-75he6mx2\\sessions\\20261004-222804-a7fa",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 7,
+      "tokens": {
+        "prompt": 33222,
+        "completion": 3941,
+        "cached": 26496
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-rename",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 37.125,
+      "verify_output": "test_get_user_behavior (test_rename.RenameHidden.test_get_user_behavior) ... ok\r\ntest_new_name_exists (test_rename.RenameHidden.test_new_name_exists) ... ok\r\ntest_no_old_name_left_in_any_py_file (test_rename.RenameHidden.test_no_old_name_left_in_any_py_file) ... ok\r\ntest_orders_unchanged (test_rename.RenameHidden.test_orders_unchanged) ... ok\r\ntest_reports_unchanged (test_rename.RenameHidden.test_reports_unchanged) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.001s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9wmjomzp\\sessions\\20261004-222938-b4d6\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-9wmjomzp\\sessions\\20261004-222938-b4d6",
+      "model": "glm-5.3-flash",
+      "model_calls": 7,
+      "tool_calls": 16,
+      "tokens": {
+        "prompt": 21786,
+        "completion": 1322,
+        "cached": 14208
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-rename",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 34.399,
+      "verify_output": "test_get_user_behavior (test_rename.RenameHidden.test_get_user_behavior) ... ok\r\ntest_new_name_exists (test_rename.RenameHidden.test_new_name_exists) ... ok\r\ntest_no_old_name_left_in_any_py_file (test_rename.RenameHidden.test_no_old_name_left_in_any_py_file) ... ok\r\ntest_orders_unchanged (test_rename.RenameHidden.test_orders_unchanged) ... ok\r\ntest_reports_unchanged (test_rename.RenameHidden.test_reports_unchanged) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.001s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-1ny55oku\\sessions\\20261004-223015-a899\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-1ny55oku\\sessions\\20261004-223015-a899",
+      "model": "glm-5.3-flash",
+      "model_calls": 6,
+      "tool_calls": 12,
+      "tokens": {
+        "prompt": 17014,
+        "completion": 996,
+        "cached": 12672
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": false,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "py-rename",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 48.436,
+      "verify_output": "test_get_user_behavior (test_rename.RenameHidden.test_get_user_behavior) ... ok\r\ntest_new_name_exists (test_rename.RenameHidden.test_new_name_exists) ... ok\r\ntest_no_old_name_left_in_any_py_file (test_rename.RenameHidden.test_no_old_name_left_in_any_py_file) ... ok\r\ntest_orders_unchanged (test_rename.RenameHidden.test_orders_unchanged) ... ok\r\ntest_reports_unchanged (test_rename.RenameHidden.test_reports_unchanged) ... ok\r\n\r\n----------------------------------------------------------------------\r\nRan 5 tests in 0.001s\r\n\r\nOK\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ke8lse4e\\sessions\\20261004-223050-172c\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-ke8lse4e\\sessions\\20261004-223050-172c",
+      "model": "glm-5.3-flash",
+      "model_calls": 8,
+      "tool_calls": 16,
+      "tokens": {
+        "prompt": 24408,
+        "completion": 1202,
+        "cached": 18880
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-compile",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 57.135,
+      "verify_output": "\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-u83wpwaw\\sessions\\20261004-223139-8185\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-u83wpwaw\\sessions\\20261004-223139-8185",
+      "model": "glm-5.3-flash",
+      "model_calls": 8,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 25727,
+        "completion": 1198,
+        "cached": 20672
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-compile",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 66.191,
+      "verify_output": "\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-7v7oz5b3\\sessions\\20261004-223236-9d13\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-7v7oz5b3\\sessions\\20261004-223236-9d13",
+      "model": "glm-5.3-flash",
+      "model_calls": 12,
+      "tool_calls": 12,
+      "tokens": {
+        "prompt": 43425,
+        "completion": 2029,
+        "cached": 37440
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-compile",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 57.667,
+      "verify_output": "\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 6 tests\r\n......\r\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qq0khgub\\sessions\\20261004-223343-569c\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-qq0khgub\\sessions\\20261004-223343-569c",
+      "model": "glm-5.3-flash",
+      "model_calls": 10,
+      "tool_calls": 10,
+      "tokens": {
+        "prompt": 33691,
+        "completion": 1701,
+        "cached": 28096
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-method",
+      "attempt": 1,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 41.327,
+      "verify_output": "\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-zoytz2jr\\sessions\\20261004-223441-280c\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-zoytz2jr\\sessions\\20261004-223441-280c",
+      "model": "glm-5.3-flash",
+      "model_calls": 10,
+      "tool_calls": 8,
+      "tokens": {
+        "prompt": 29274,
+        "completion": 1115,
+        "cached": 24384
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-method",
+      "attempt": 2,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 66.18,
+      "verify_output": "\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vbfsda0r\\sessions\\20261004-223523-aa48\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-vbfsda0r\\sessions\\20261004-223523-aa48",
+      "model": "glm-5.3-flash",
+      "model_calls": 10,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 29340,
+        "completion": 1198,
+        "cached": 24320
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    },
+    {
+      "task": "rs-method",
+      "attempt": 3,
+      "status": "pass",
+      "pass": true,
+      "exit_code": 0,
+      "timed_out": false,
+      "wall_s": 50.802,
+      "verify_output": "\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nrunning 0 tests\r\n\r\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\n\r\nrunning 4 tests\r\n....\r\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\r\n\r\n\r\nok\r\n",
+      "stderr_tail": "session: C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-z2exye7w\\sessions\\20261004-223630-cd10\n",
+      "kept_dir": null,
+      "session_dir": "C:\\Users\\zazuk\\.xolotl\\projects\\C--Users-zazuk-AppData-Local-Temp-xolotl-bench-z2exye7w\\sessions\\20261004-223630-cd10",
+      "model": "glm-5.3-flash",
+      "model_calls": 9,
+      "tool_calls": 9,
+      "tokens": {
+        "prompt": 26481,
+        "completion": 1255,
+        "cached": 20736
+      },
+      "compactions": {
+        "stage1": 0,
+        "stage2": 0
+      },
+      "completion_check": true,
+      "errors": 0,
+      "policy_hash": "e381398ffa98e555",
+      "interrupted": false
+    }
+  ],
+  "summary": {
+    "pass": 36,
+    "total": 36,
+    "skipped": 0,
+    "pass_rate": 1.0,
+    "per_task": {
+      "env-tool": "3/3",
+      "js-fix": "3/3",
+      "long-context": "3/3",
+      "py-argparse": "3/3",
+      "py-crossmodule": "3/3",
+      "py-docstring": "3/3",
+      "py-logparse": "3/3",
+      "py-offbyone": "3/3",
+      "py-perf": "3/3",
+      "py-rename": "3/3",
+      "rs-compile": "3/3",
+      "rs-method": "3/3"
+    },
+    "tokens": {
+      "prompt": 1052547,
+      "completion": 69816,
+      "cached": 782976
+    },
+    "median_wall_s": 49.619,
+    "total_wall_s": 2670.651
+  },
+  "tasks_hash": "09833ed2b360",
+  "tasks_hash_note": "backfilled after the run: computed with bench/run.py --fingerprint (0f416e9) over the task tree, unchanged since 24ed0aa"
+}
