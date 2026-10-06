@@ -50,7 +50,7 @@ PYTHONPATH=bench/tb2 harbor run -d terminal-bench@2.0 -a xolotl_harbor.agent:Xol
 `run()` executes one shell command whose instruction is base64-encoded, so quoting can't break it. Xolotl runs under
 `timeout -s INT -k 5 <task timeout - 60 s>` (SIGINT, which Xolotl handles like Ctrl+C so the call in flight is saved to the
 trace, then SIGKILL 5 s later, so it is guaranteed gone; floor 60 s; see Timeouts) and `--deadline <same seconds>`, so it
-lowers its reasoning effort and adds time notes as the budget runs down (`policy.rs`). The command always exits 0: Xolotl's own exit code goes
+lowers its reasoning effort, adds time notes as the budget runs down, and cuts a thought that has reasoned for `max(150 s, half the time left)` without a tool call or an answer (`policy.rs`). The command always exits 0: Xolotl's own exit code goes
 to `/logs/agent/exit_code`, and the verifier decides pass or fail. `core.py` copies the metrics and infra functions of
 `bench/run.py` (Harbor's interpreter can't import `bench`); a test asserts identical output.
 

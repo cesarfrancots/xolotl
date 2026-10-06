@@ -18,7 +18,7 @@ Set your Z.ai key once as a user environment variable named `ZAI_API_KEY`. `xol`
 xol                      # interactive, in the current directory
 xol --cwd D:\some\repo   # interactive, in another project
 xol -p "fix the failing test" --mode yolo   # one task, headless (JSON events on stdout)
-xol -p "..." --deadline 840   # also tell it the run is killed after 840 s: it lowers its reasoning effort and adds time notes as the budget runs down
+xol -p "..." --deadline 840   # also tell it the run is killed after 840 s: it lowers its reasoning effort, adds time notes as the budget runs down, and cuts a thought that runs far too long without acting
 xol --version
 ```
 

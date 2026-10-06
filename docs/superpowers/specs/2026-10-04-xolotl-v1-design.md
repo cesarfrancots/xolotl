@@ -248,11 +248,11 @@ Every event is one compact JSON line with `seq`, `t_ms` (unix milliseconds) and 
 |---|---|
 | `session_start` | `cwd, model, mode, policy_hash, system` (the full system prompt, so the trace shows exactly what the model saw and `build_view` stays a pure function of the events) |
 | `user` | `text` |
-| `assistant` | `text, reasoning, tool_calls[{id, name, args}], usage{prompt, completion, cached}, finish_reason, latency_ms` |
+| `assistant` | `text, reasoning, tool_calls[{id, name, args}], usage{prompt, completion, cached}, finish_reason, latency_ms, effort?, think_ms?` (`effort`: the `reasoning_effort` sent, absent when none was; `think_ms`: ms of reasoning before the first content or tool-call token, or the whole call if none came) |
 | `tool_result` | `call_id, name, ok, output` (capped), `artifact?, bytes, duration_ms, exit_code?` |
 | `permission` | `call_id, decision: allow\|deny\|always, by: user\|rule\|mode` |
 | `compaction` | `stage: 1\|2, upto_seq` (stage 1), `from_seq, to_seq, summary_path, summary, tokens_before` (stage 2; `summary` is the full text placed in the view) |
-| `nudge` | `reason: completion_check\|repeat\|empty, text`. A harness-written message; `build_view` renders it as a user-role message. |
+| `nudge` | `reason: completion_check\|repeat\|empty\|time\|think_cap, text`. A harness-written message; `build_view` renders it as a user-role message. |
 | `interrupt` | `during: stream\|tool, call_id?` |
 | `error` | `kind, message, retry` |
 | `session_end` | `status` |

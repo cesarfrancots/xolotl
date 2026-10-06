@@ -18,6 +18,8 @@ pub const SESSION_WRITE_FAILED: &str = "cannot write session";
 const CANCELLED: &str = "cancelled by user";
 const HEADLESS_DENIED: &str = "denied: not allowed in headless mode (use --mode or --allow)";
 const EMPTY_NUDGE: &str = "(empty response — continue the task, or reply with your answer)";
+/// The text of an assistant turn the thinking cap ended (like `[interrupted]` for a Ctrl+C): keeps the turn non-empty for the API.
+const THINK_CUT: &str = "[thinking cut off]";
 /// Lines of an edit/write diff shown in a permission prompt.
 const DIFF_LINES: usize = 20;
 /// Tool output longer than this (bytes) is also saved to `artifacts/<call-id>.txt`, so its stage-1 stub has a `full:` path.
@@ -144,6 +146,7 @@ impl Agent<'_> {
             return Ok(Ok(()));
         };
         let tokens_before = policy::estimate_tokens(events) as u64;
+        self.model.think_cap(None); // a summary is not paced: a cut one would only fail the compaction
         let mut view = if overflowed { policy::stubbed_view(events) } else { policy::build_view(events) };
         let prompt = policy::summary_prompt(focus);
         match view.last_mut() {
@@ -209,6 +212,7 @@ impl Agent<'_> {
         let mut recent: Vec<Seen> = Vec::new(); // tool results since the last repeat nudge
         let mut stage2_failed = false;
         let mut time_notes = 0;
+        let (mut cuts, mut after_cut) = (0, false); // thinking-cap cuts so far, and whether the next call follows one
         loop {
             // Before every model call, a request's first included: tool-free turns grow the context too. Not while a
             // Ctrl+C is pending: the check below ends the request, and a summary call now would only be cut short.
@@ -225,7 +229,7 @@ impl Agent<'_> {
                 }
                 steps = 0;
             }
-            self.pace(&mut time_notes)?;
+            self.pace(&mut time_notes, cuts, std::mem::take(&mut after_cut))?;
             let view = policy::build_view(&self.session.events);
             let t0 = Instant::now();
             let ui = &mut *self.ui;
@@ -264,13 +268,24 @@ impl Agent<'_> {
             steps += 1;
             *tool_calls += reply.tool_calls.len();
             let latency_ms = t0.elapsed().as_millis() as u64;
-            let Reply { text, reasoning, tool_calls: calls, usage, finish_reason, interrupted } = reply;
+            let Reply { text, reasoning, tool_calls: calls, usage, finish_reason, interrupted, capped, think_ms, effort } = reply;
             if interrupted {
                 let text = format!("{text}\n[interrupted]");
-                self.append(Kind::Assistant { text, reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms })?;
+                self.append(Kind::Assistant { text, reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms, effort, think_ms })?;
                 return self.interrupt(&calls, "stream", None);
             }
-            self.append(Kind::Assistant { text: text.clone(), reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms })?;
+            if capped {
+                // The thought stays in the history, as for an interrupt, so the model acts on it. The turn carries a marker as its
+                // text and no tool calls whatever the reply held, so nothing is left unanswered; a nudge follows, and the next
+                // call runs at `low`.
+                let thought = Duration::from_millis(think_ms.unwrap_or(0));
+                let finish_reason = "think_cap".to_string();
+                self.append(Kind::Assistant { text: THINK_CUT.into(), reasoning, tool_calls: vec![], usage, finish_reason, latency_ms, effort, think_ms })?;
+                self.append(nudge("think_cap", policy::think_note(thought)))?;
+                (cuts, after_cut) = (cuts + 1, true);
+                continue;
+            }
+            self.append(Kind::Assistant { text: text.clone(), reasoning, tool_calls: calls.clone(), usage, finish_reason, latency_ms, effort, think_ms })?;
 
             if calls.is_empty() && text.trim().is_empty() {
                 if empty_retried {
@@ -312,12 +327,15 @@ impl Agent<'_> {
         }
     }
 
-    /// With a deadline, before every model call: caps the reasoning effort by the time left, and the first time the budget
-    /// falls to each `time_note_pct` threshold adds one `time` nudge. `notes`: how many thresholds have fired.
-    fn pace(&mut self, notes: &mut usize) -> Result<(), Outcome> {
+    /// With a deadline, before every model call: caps the reasoning effort by the time left (at `low` right after a thinking
+    /// cut), bounds how long the call may reason before it acts (until `think_cap_fires` cuts, `cuts`, have been used), and
+    /// the first time the budget falls to each `time_note_pct` threshold adds one `time` nudge. `notes`: how many
+    /// thresholds have fired. Without a deadline nothing is set, so the model runs exactly as before.
+    fn pace(&mut self, notes: &mut usize, cuts: usize, after_cut: bool) -> Result<(), Outcome> {
         let Some(d) = self.deadline else { return Ok(()) };
         let left = d.remaining();
-        self.model.cap_effort(policy::effort_cap(left));
+        self.model.cap_effort(if after_cut { Some("low") } else { policy::effort_cap(left) });
+        self.model.think_cap((cuts < LIMITS.think_cap_fires).then(|| policy::think_cap(left)));
         let pct = (left.as_secs_f64() * 100.0 / d.total.as_secs_f64()) as u64;
         let crossed = LIMITS.time_note_pct.iter().filter(|&&p| pct <= p).count();
         if crossed > *notes {
@@ -648,6 +666,8 @@ mod tests {
             usage: Usage::default(),
             finish_reason: "stop".into(),
             latency_ms: 0,
+            effort: None,
+            think_ms: None,
         };
         a.session.append(reply).unwrap();
     }
@@ -684,7 +704,7 @@ mod tests {
         fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
         assert_eq!(a.run_request("look"), Outcome::Done);
         let Agent { session, .. } = a;
-        assert!(m.caps.is_empty() && nudges(&session.events, "time").is_empty());
+        assert!(m.caps.is_empty() && m.think_caps.is_empty() && nudges(&session.events, "time").is_empty());
     }
 
     #[test]
@@ -730,6 +750,163 @@ mod tests {
         let Agent { session, .. } = a;
         assert_eq!(m.caps, [None]); // the cap is lifted explicitly, so an earlier one cannot stick
         assert!(nudges(&session.events, "time").is_empty());
+    }
+
+    /// `(effort, think_ms)` of every assistant event.
+    fn trace_fields(events: &[Event]) -> Vec<(Option<String>, Option<u64>)> {
+        events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Kind::Assistant { effort, think_ms, .. } => Some((effort.clone(), *think_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assistant_events_record_the_effort_sent_and_the_think_time() {
+        let thought = Reply { reasoning: "hmm".into(), think_ms: Some(4_200), ..read_a("c1").unwrap() };
+        let mut m = Scripted::new(vec![Ok(thought), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("tracefields", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(400, 1000)); // medium
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(trace_fields(&session.events), [(Some("medium".to_string()), Some(4_200)), (Some("medium".to_string()), None)]);
+
+        // no deadline: nothing is sent, so nothing is recorded as sent
+        let mut m = Scripted::new(vec![text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("tracefields2", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        assert_eq!(a.run_request("hi"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(trace_fields(&session.events), [(None, None)]);
+    }
+
+    /// What a client returns when its thinking cap ended the call: reasoning only.
+    fn capped(thought: &str, think_ms: u64) -> Result<Reply, LlmError> {
+        Ok(Reply { reasoning: thought.into(), capped: true, think_ms: Some(think_ms), ..Default::default() })
+    }
+    /// A request's messages must never hold an assistant turn with neither text nor tool calls.
+    fn no_empty_assistant(req: &(Vec<Message>, usize)) -> bool {
+        req.0.iter().all(|m| !matches!(m, Message::Assistant { text, tool_calls, .. } if text.is_empty() && tool_calls.is_empty()))
+    }
+
+    #[test]
+    fn thinking_cap_follows_the_time_left_and_needs_a_deadline() {
+        let s = Duration::from_secs;
+        let cap_for = |tag: &str, left_s: Option<u64>| {
+            let mut m = Scripted::new(vec![text("done")]);
+            let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+            let mut a = agent(tag, Mode::Yolo, false, &mut m, &mut ui, &cancel);
+            a.deadline = left_s.map(|n| deadline_in(n, 3600));
+            assert_eq!(a.run_request("hi"), Outcome::Done);
+            m.think_caps
+        };
+        let caps = cap_for("thinkcap1", Some(2000)); // half the time left, as the clock has moved a little
+        assert!(caps.len() == 1 && caps[0].is_some_and(|c| c <= s(1000) && c > s(990)), "{caps:?}");
+        assert_eq!(cap_for("thinkcap2", Some(100)), [Some(s(150))]); // the floor
+        assert_eq!(cap_for("thinkcap3", None), []); // no deadline: no cap is ever set
+    }
+
+    #[test]
+    fn a_cut_thought_is_kept_and_nudged_and_the_request_goes_on() {
+        let mut m = Scripted::new(vec![capped("long thought", 420_000), read_a("c1"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut1", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(3000, 3600));
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+
+        // the trace: the turn with its reasoning and think time, the nudge right after it, and no interrupt
+        let at = session.events.iter().position(|e| matches!(&e.kind, Kind::Assistant { finish_reason, .. } if finish_reason == "think_cap")).unwrap();
+        let Kind::Assistant { text, reasoning, tool_calls, think_ms, .. } = &session.events[at].kind else { unreachable!() };
+        assert_eq!((text.as_str(), reasoning.as_str(), tool_calls.len(), *think_ms), ("[thinking cut off]", "long thought", 0, Some(420_000)));
+        let Kind::Nudge { reason, text: note } = &session.events[at + 1].kind else { panic!("no nudge after the cut") };
+        assert_eq!(reason, "think_cap");
+        assert!(note.contains("about 7 minutes") && note.contains("simplest working version"), "{note}");
+        assert!(interrupts(&session.events).is_empty());
+
+        // the request: the thought is resent with the turn, then the note as the next user message; nothing the API would refuse
+        let second = &m.requests[1];
+        let n = second.0.len();
+        assert!(matches!(&second.0[n - 2], Message::Assistant { text, reasoning: Some(r), tool_calls } if text == "[thinking cut off]" && r == "long thought" && tool_calls.is_empty()));
+        let wire = second.0[n - 2].to_wire(); // as the API receives it: non-empty content, the thought, no tool_calls key
+        assert_eq!((wire["content"].as_str(), wire["reasoning_content"].as_str(), wire.get("tool_calls")), (Some("[thinking cut off]"), Some("long thought"), None));
+        assert_eq!(last_user(second), *note);
+        assert!(m.requests.iter().all(no_empty_assistant));
+        assert_eq!(m.requests.len(), 3); // the cut call, the call after it, the call after the read
+    }
+
+    #[test]
+    fn a_cut_turn_never_leaves_tool_calls_unanswered() {
+        // a client never returns a capped reply with calls, but the turn must not depend on it
+        let stray = Ok(Reply { tool_calls: vec![tc("c9", "read", "{}")], text: "x".into(), ..capped("t", 1).unwrap() });
+        let mut m = Scripted::new(vec![stray, text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut2", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(3000, 3600));
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert!(results(&session.events).is_empty() && ui.started.is_empty());
+        assert!(m.requests.iter().all(|r| r.0.iter().all(|msg| !matches!(msg, Message::Assistant { tool_calls, .. } if !tool_calls.is_empty()))));
+    }
+
+    #[test]
+    fn the_call_after_a_cut_runs_at_low_and_only_that_one() {
+        let mut m = Scripted::new(vec![capped("t", 1), read_a("c1"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut3", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(3000, 3600)); // plenty of time: no time cap of its own
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(m.caps, [None, Some("low".to_string()), None]);
+        let efforts: Vec<_> = trace_fields(&session.events).into_iter().map(|(e, _)| e).collect();
+        assert_eq!(efforts, [None, Some("low".to_string()), None]); // and the trace says so
+
+        // under a time cap the call after a cut is still `low`, then the time cap applies again
+        let mut m = Scripted::new(vec![capped("t", 1), read_a("c1"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut3b", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(900, 1000));
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        assert_eq!(m.caps, [Some("medium".to_string()), Some("low".into()), Some("medium".into())]);
+    }
+
+    #[test]
+    fn the_cap_stops_after_its_cuts_are_used_up() {
+        let mut m = Scripted::new(vec![capped("a", 1), capped("b", 1), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut4", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(3000, 3600));
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(nudges(&session.events, "think_cap").len(), LIMITS.think_cap_fires);
+        let on: Vec<bool> = m.think_caps.iter().map(Option::is_some).collect();
+        assert_eq!(on, [true, true, false]); // the third call is not capped
+    }
+
+    #[test]
+    fn the_cut_and_the_time_note_keep_their_order() {
+        // 10% of the budget left: the time note is added before the first call, the cut note right after the cut
+        let mut m = Scripted::new(vec![capped("t", 150_000), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("cut5", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(100, 1000));
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        let kinds: Vec<&str> = session.events.iter().filter_map(|e| match &e.kind {
+            Kind::Nudge { reason, .. } => Some(reason.as_str()),
+            Kind::Assistant { .. } => Some("assistant"),
+            _ => None,
+        }).collect();
+        assert_eq!(kinds, ["time", "assistant", "think_cap", "assistant"]);
+        assert_eq!(m.caps, [Some("low".to_string()), Some("low".into())]);
+        assert_eq!(last_user(&m.requests[1]), policy::think_note(Duration::from_secs(150)));
     }
 
     #[test]
@@ -1258,6 +1435,8 @@ mod tests {
             usage: Usage::default(),
             finish_reason: "stop".into(),
             latency_ms: 0,
+            effort: None,
+            think_ms: None,
         };
         let big = "r".repeat(5_000);
         a.session.append(Kind::User { text: "earlier".into() }).unwrap();
