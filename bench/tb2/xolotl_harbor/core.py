@@ -67,13 +67,16 @@ def resolve_timeout(override: object, environment_dir: Path | str | None) -> dic
 def run_command(instruction: str, model: str, timeout_s: int) -> str:
     """The shell command run in the task container. The instruction travels base64-encoded, so no quote, `$()`, newline
     or unicode in it can break or inject into the command. Always exits 0: Xolotl's own exit code goes to
-    /logs/agent/exit_code, so it never becomes a Harbor exception and the verifier decides pass or fail. `timeout -k 5`
-    sends SIGKILL 5 s after SIGTERM, so Xolotl is guaranteed to be gone before the logs are copied."""
+    /logs/agent/exit_code, so it never becomes a Harbor exception and the verifier decides pass or fail. `timeout -s INT`
+    sends Xolotl the Ctrl+C it already handles (the model call or tool in flight is cancelled and its partial output stays
+    in the trace; a plain SIGTERM would lose it), and `-k 5` sends SIGKILL 5 s later, so Xolotl is guaranteed to be gone
+    before the logs are copied. `--deadline` gives Xolotl the same number of seconds, so it paces its reasoning effort by
+    the time left."""
     b64 = base64.b64encode(instruction.encode("utf-8")).decode("ascii")
     return (
         f'cd "$PWD"\n'  # the task's own WORKDIR, not always /app
-        f"timeout -k 5 {int(timeout_s)} {BINARY} -p \"$(printf %s '{b64}' | base64 -d)\" --mode yolo --cwd \"$PWD\" "
-        f"--model {shlex.quote(model)} > {LOGS}/xolotl.jsonl 2> {LOGS}/xolotl.stderr < /dev/null\n"
+        f"timeout -s INT -k 5 {int(timeout_s)} {BINARY} -p \"$(printf %s '{b64}' | base64 -d)\" --mode yolo --cwd \"$PWD\" "
+        f"--model {shlex.quote(model)} --deadline {int(timeout_s)} > {LOGS}/xolotl.jsonl 2> {LOGS}/xolotl.stderr < /dev/null\n"
         f"echo $? > {LOGS}/exit_code\n"
         f"mkdir -p {LOGS}/xolotl-home && cp -r /root/.xolotl/. {LOGS}/xolotl-home/ 2>/dev/null\n"
         "true"

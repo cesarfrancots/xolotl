@@ -6,6 +6,7 @@ use crate::store::{Event, Kind};
 use crate::tools::{Shell, clip, clip_tail};
 use serde_json::Value;
 use std::path::Path;
+use std::time::Duration;
 
 pub struct Limits {
     pub step_limit: usize,
@@ -21,6 +22,11 @@ pub struct Limits {
     pub snapshot_timeout_s: u64,
     pub agents_md_max: usize,
     pub toc_user_chars: usize,
+    /// With a deadline: below this many seconds left the reasoning effort is capped at `medium`, below the next at `low`.
+    pub effort_medium_below_s: u64,
+    pub effort_low_below_s: u64,
+    /// With a deadline: the percentages of the budget left at which a `time` nudge is added (descending).
+    pub time_note_pct: [u64; 2],
 }
 
 pub const LIMITS: Limits = Limits {
@@ -37,6 +43,11 @@ pub const LIMITS: Limits = Limits {
     snapshot_timeout_s: 15,
     agents_md_max: 20_000,
     toc_user_chars: 500,
+    // ponytail: read off the TB2 hard-set traces (~45 tokens/s; a max-effort call thinks 8-24k tokens = 3-10 min), not tuned.
+    // Ceiling: one step function for every task and a call already in flight keeps its effort; upgrade: a per-call thinking cap.
+    effort_medium_below_s: 1000,
+    effort_low_below_s: 240,
+    time_note_pct: [50, 20],
 };
 
 /// Resend each assistant turn's `reasoning_content` verbatim (docs/glm-api-notes.md, decision 2: without it the model loses its own thinking).
@@ -131,6 +142,33 @@ pub fn completion_check(original_request: &str) -> String {
 2. Is any debug code, temp file or stray change left over? Remove it.
 3. Then reply with a short summary of what changed and how you verified it."#
     )
+}
+
+/// Reasoning effort cap for the time left (`--deadline`): reasoning tokens are most of the wall clock, so effort drops as
+/// the clock runs down. `None`: no cap. The caller lowers its configured effort to this, never raises it.
+pub fn effort_cap(remaining: Duration) -> Option<&'static str> {
+    match remaining.as_secs() {
+        s if s < LIMITS.effort_low_below_s => Some("low"),
+        s if s < LIMITS.effort_medium_below_s => Some("medium"),
+        _ => None,
+    }
+}
+
+/// The `time` nudge for threshold `tier` (an index into `LIMITS.time_note_pct`), with `remaining` of the budget left.
+pub fn time_note(tier: usize, remaining: Duration) -> String {
+    let left = match remaining.as_secs().div_ceil(60) {
+        0 => "under a minute".to_string(),
+        1 => "about 1 minute".to_string(),
+        m => format!("about {m} minutes"),
+    };
+    if tier == 0 {
+        format!(
+            "Time check: {left} of your time budget left. Make sure everything the task asks for exists and works now, even if rough, \
+             then improve it. Run something to find out instead of deliberating at length."
+        )
+    } else {
+        format!("Time check: {left} left. Wrap up: get the deliverable into a working state, verify it once, and stop. No new designs or refactors.")
+    }
 }
 
 /// What the model sees of a tool result. `bash` keeps head and tail (errors and summaries sit at the end); everything else keeps the head.
@@ -562,6 +600,25 @@ mod tests {
         let p = system_prompt("e", Some(&long), dir);
         let md = p.split("# Project instructions (AGENTS.md)\n").nth(1).unwrap();
         assert!(!md.is_empty() && md.len() <= 20_000);
+    }
+
+    #[test]
+    fn effort_follows_the_time_left() {
+        let s = Duration::from_secs;
+        assert_eq!([5000, 1000, 999, 240, 239, 0].map(|n| effort_cap(s(n))), [None, None, Some("medium"), Some("medium"), Some("low"), Some("low")]);
+        // the thresholds are ordered, or `low` could never apply
+        assert!(LIMITS.effort_low_below_s < LIMITS.effort_medium_below_s && LIMITS.time_note_pct[0] > LIMITS.time_note_pct[1]);
+    }
+
+    #[test]
+    fn time_notes_say_how_long_is_left() {
+        let s = Duration::from_secs;
+        let first = time_note(0, s(420));
+        assert!(first.starts_with("Time check: about 7 minutes of your time budget left") && first.contains("exists and works now"), "{first}");
+        assert!(time_note(1, s(61)).contains("about 2 minutes left"), "rounds up: a minute that has begun is still left");
+        assert!(time_note(1, s(60)).contains("about 1 minute left"));
+        assert!(time_note(1, s(0)).starts_with("Time check: under a minute left"));
+        assert!(time_note(1, s(100)).contains("Wrap up"));
     }
 
     #[test]

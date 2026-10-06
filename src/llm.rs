@@ -79,23 +79,45 @@ impl fmt::Display for LlmError {
     }
 }
 
+/// The `reasoning_effort` values the API documents, strongest first. It silently accepts any other value
+/// (docs/glm-api-notes.md #5).
+pub const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+
+/// The weaker of `base` (`None`: the API default, `max`) and `cap`; a cap that isn't a documented value changes nothing.
+pub fn lower_effort<'a>(base: Option<&'a str>, cap: Option<&'a str>) -> Option<&'a str> {
+    let rank = |e: &str| EFFORTS.iter().position(|x| *x == e);
+    match (base, cap) {
+        (_, None) => base,
+        (None, Some(c)) => rank(c).map(|_| c),
+        (Some(b), Some(c)) => match (rank(b), rank(c)) {
+            (Some(rb), Some(rc)) if rc > rb => Some(c),
+            _ => Some(b),
+        },
+    }
+}
+
 pub trait Model {
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), cancel: &AtomicBool) -> Result<Reply, LlmError>;
+
+    /// Limits the reasoning effort of the calls that follow (never raises it); `None` lifts the limit. Ignored by default.
+    fn cap_effort(&mut self, _cap: Option<&str>) {}
 }
 
-/// Replays canned replies in order and records each request as `(messages, tool count)`.
+/// Replays canned replies in order and records each request as `(messages, tool count)`, and each effort cap it was given.
 #[allow(dead_code)] // test double: only the tests use it
-pub struct Scripted { replies: VecDeque<Result<Reply, LlmError>>, pub requests: Vec<(Vec<Message>, usize)> }
+pub struct Scripted { replies: VecDeque<Result<Reply, LlmError>>, pub requests: Vec<(Vec<Message>, usize)>, pub caps: Vec<Option<String>> }
 
 #[allow(dead_code)] // test double: only the tests use it
 impl Scripted {
     pub fn new(replies: Vec<Result<Reply, LlmError>>) -> Self {
-        Scripted { replies: replies.into(), requests: Vec::new() }
+        Scripted { replies: replies.into(), requests: Vec::new(), caps: Vec::new() }
     }
 }
 
 impl Model for Scripted {
+    fn cap_effort(&mut self, cap: Option<&str>) { self.caps.push(cap.map(String::from)); }
+
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), _cancel: &AtomicBool) -> Result<Reply, LlmError> {
         self.requests.push((messages.to_vec(), tools.len()));
@@ -116,7 +138,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often `attempt` wakes to check `cancel` while waiting for the worker.
 const POLL: Duration = Duration::from_millis(100);
 
-pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent, idle: Duration }
+pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent, idle: Duration, effort_cap: Option<String> }
 
 /// What the worker thread reports back to `attempt`.
 enum Msg {
@@ -131,7 +153,14 @@ impl ZaiClient {
         // No global/body timeout: a stream may legitimately run for minutes; `attempt` enforces the idle limit.
         let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder()
             .http_status_as_error(false).timeout_connect(Some(Duration::from_secs(30))).build());
-        ZaiClient { cfg, agent, idle: IDLE_TIMEOUT }
+        ZaiClient { cfg, agent, idle: IDLE_TIMEOUT, effort_cap: None }
+    }
+
+    /// The request body, with the reasoning effort lowered to the current cap.
+    fn body(&self, messages: &[Message], tools: &[Value]) -> Value {
+        let mut b = request_body(&self.cfg, messages, tools);
+        if let Some(e) = lower_effort(self.cfg.reasoning_effort.as_deref(), self.effort_cap.as_deref()) { b["reasoning_effort"] = json!(e); }
+        b
     }
 
     /// Starts the request on a worker thread. A blocking read cannot be interrupted, so the worker simply
@@ -225,7 +254,7 @@ fn stream_complete(done: bool, finish_reason: &str) -> bool { done || !finish_re
 impl Model for ZaiClient {
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), cancel: &AtomicBool) -> Result<Reply, LlmError> {
-        let body = request_body(&self.cfg, messages, tools).to_string();
+        let body = self.body(messages, tools).to_string();
         let mut n = 0;
         loop {
             let mut state = StreamState::default();
@@ -239,6 +268,8 @@ impl Model for ZaiClient {
             n += 1;
         }
     }
+
+    fn cap_effort(&mut self, cap: Option<&str>) { self.effort_cap = cap.map(String::from); }
 }
 
 fn request_body(cfg: &ZaiConfig, messages: &[Message], tools: &[Value]) -> Value {
@@ -594,6 +625,27 @@ mod tests {
         let b = request_body(&cfg, &msgs, &[json!({"type":"function"})]);
         assert_eq!((b["tools"].as_array().map(Vec::len), b["reasoning_effort"].as_str()), (Some(1), Some("max")));
     }
+    #[test] fn effort_cap_only_lowers() {
+        assert_eq!(lower_effort(Some("max"), Some("medium")), Some("medium"));
+        assert_eq!(lower_effort(Some("low"), Some("medium")), Some("low")); // never raised
+        assert_eq!(lower_effort(Some("medium"), Some("medium")), Some("medium"));
+        assert_eq!(lower_effort(Some("max"), None), Some("max"));
+        assert_eq!(lower_effort(None, None), None); // the API default stays unsent
+        assert_eq!(lower_effort(None, Some("low")), Some("low")); // default is max, so low is a cut
+        assert_eq!(lower_effort(Some("max"), Some("bogus")), Some("max")); // an unknown cap changes nothing
+        assert_eq!(lower_effort(None, Some("bogus")), None);
+        assert_eq!(lower_effort(Some("bogus"), Some("low")), Some("bogus")); // nor does an unknown base get replaced
+    }
+    #[test] fn cap_lands_in_the_request_body() {
+        let mut c = ZaiClient::new(ZaiConfig { base_url: "u".into(), model: "m".into(), api_key: "k".into(),
+                                               temperature: 1.0, top_p: 0.95, reasoning_effort: Some("max".into()) });
+        let effort = |c: &ZaiClient| c.body(&[], &[])["reasoning_effort"].as_str().map(String::from);
+        assert_eq!(effort(&c), Some("max".into()));
+        c.cap_effort(Some("medium"));
+        assert_eq!(effort(&c), Some("medium".into()));
+        c.cap_effort(None); // lifting the cap restores the configured effort
+        assert_eq!(effort(&c), Some("max".into()));
+    }
     #[test] fn stream_needs_done_or_finish_reason() {
         assert!(stream_complete(true, "") && stream_complete(false, "stop"));
         assert!(!stream_complete(false, ""));
@@ -627,6 +679,14 @@ mod tests {
             c.complete(&[], &[], &mut |_| {}, &cancel)
         }).unwrap();
         assert!(r.interrupted && t.elapsed() < Duration::from_secs(2));
+    }
+    #[test] fn cancel_keeps_the_partial_reasoning() {
+        // What a SIGINT from `timeout` relies on: the thinking streamed so far still reaches the trace.
+        let mut c = server("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"half a thought\"}}]}\n\n",
+                           Duration::from_secs(3));
+        let cancel = AtomicBool::new(false);
+        let r = c.complete(&[], &[], &mut |d| if let Delta::Reasoning(_) = d { cancel.store(true, Ordering::Relaxed) }, &cancel).unwrap();
+        assert_eq!((r.interrupted, r.reasoning.as_str()), (true, "half a thought"));
     }
     #[test] fn silent_server_trips_idle_timeout_and_retries() {
         let mut c = server("", Duration::from_secs(3));

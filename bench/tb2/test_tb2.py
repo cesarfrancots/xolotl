@@ -119,14 +119,14 @@ class CoreTests(unittest.TestCase):
         literals = re.findall(r"printf %s '([A-Za-z0-9+/=]+)'", cmd)
         self.assertEqual(len(literals), 1)
         self.assertEqual(base64.b64decode(literals[0]).decode("utf-8"), instruction)
-        for part in ("timeout -k 5 840 /installed-agent/xolotl", "--mode yolo", '--cwd "$PWD"', "--model glm-5.3-flash",
-                     "> /logs/agent/xolotl.jsonl", "echo $? > /logs/agent/exit_code", "< /dev/null"):
+        for part in ("timeout -s INT -k 5 840 /installed-agent/xolotl", "--mode yolo", '--cwd "$PWD"', "--model glm-5.3-flash",
+                     "--deadline 840 > /logs/agent/xolotl.jsonl", "echo $? > /logs/agent/exit_code", "< /dev/null"):
             self.assertIn(part, cmd)
         self.assertTrue(cmd.rstrip().endswith("true"))
 
     def test_command_quotes_model(self):
         cmd = core.run_command("hi", "evil model; rm -rf /", 60)
-        self.assertIn("--model 'evil model; rm -rf /' >", cmd)  # one shell word, whatever -m contained
+        self.assertIn("--model 'evil model; rm -rf /' --deadline 60 >", cmd)  # one shell word, whatever -m contained
 
     def test_metrics_from_jsonl(self):
         m = core.metrics_from_jsonl("\n".join(STREAM))
@@ -204,7 +204,8 @@ class AgentTests(unittest.TestCase):
                 logs = Path(d) / "agent"
                 logs.mkdir()
                 (cmd, env), = self.run_agent(make_task(Path(d), task_timeout), logs)
-                self.assertIn(f"timeout -k 5 {budget} /installed-agent/xolotl", cmd)
+                self.assertIn(f"timeout -s INT -k 5 {budget} /installed-agent/xolotl", cmd)
+                self.assertIn(f" --deadline {budget} > ", cmd)  # Xolotl paces itself by the same budget it is killed at
                 self.assertEqual(env, {"ZAI_API_KEY": "fake-key"})  # the key only via env=, never in the command
                 self.assertNotIn("fake-key", cmd)
                 rec = json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))
@@ -215,13 +216,14 @@ class AgentTests(unittest.TestCase):
             logs = Path(d) / "agent"
             logs.mkdir()
             (cmd, _), = self.run_agent(make_task(Path(d)), logs, agent_timeout_sec=600)  # --ak agent_timeout_sec=600
-            self.assertIn("timeout -k 5 540 ", cmd)
+            self.assertIn("timeout -s INT -k 5 540 ", cmd)
+            self.assertIn(" --deadline 540 ", cmd)
             self.assertEqual(json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))["source"], "kwarg")
         with tempfile.TemporaryDirectory() as d:  # no task.toml reachable: the default, recorded as such
             logs = Path(d) / "agent"
             logs.mkdir()
             (cmd, _), = self.run_agent(make_task(Path(d), None), logs)
-            self.assertIn("timeout -k 5 840 ", cmd)
+            self.assertIn("timeout -s INT -k 5 840 ", cmd)
             self.assertEqual(json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))["source"], "default")
 
     def test_bad_override_fails_at_construction(self):
@@ -232,7 +234,7 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             calls = self.run_agent(make_task(Path(d)), Path(d) / "no-such-logs-dir")  # the record can't be written
             self.assertEqual(len(calls), 1)
-            self.assertIn("timeout -k 5 1740 ", calls[0][0])
+            self.assertIn("timeout -s INT -k 5 1740 ", calls[0][0])
 
 
 class WrapperTests(unittest.TestCase):

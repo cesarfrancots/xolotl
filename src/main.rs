@@ -8,10 +8,10 @@ mod store;
 mod tools;
 mod ui;
 
-use agent::{Agent, Outcome};
+use agent::{Agent, Deadline, Outcome};
 use crossterm::event::{self, KeyEvent, KeyEventKind};
 use crossterm::style::Stylize;
-use llm::{ZaiClient, ZaiConfig};
+use llm::{EFFORTS, ZaiClient, ZaiConfig};
 use perms::{Mode, Perms};
 use reedline::{
     ColumnarMenu, DefaultCompleter, DefaultPrompt, DefaultPromptSegment, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
@@ -24,7 +24,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs};
 use store::{Event, Kind, Meta, Session};
 use tools::{Shell, ToolCtx};
@@ -35,9 +35,7 @@ use ui::{Headless, Status, Terminal, Ui, status_line};
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str =
-    "usage: xol [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>] [--version]";
-/// The `reasoning_effort` values the API documents. It silently accepts any other value (docs/glm-api-notes.md #5).
-const EFFORTS: [&str; 7] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
+    "usage: xol [-p <task>] [--mode ask|writes|yolo] [--cwd <dir>] [--resume [id]] [--budget <tokens>] [--allow <bash-prefix>]... [--model <id>] [--deadline <secs>] [--version]";
 const SLASH_COMMANDS: [&str; 8] = ["/help", "/mode", "/compact", "/clear", "/resume", "/think", "/status", "/exit"];
 const HELP: &str = "\
 /help                     this list
@@ -64,6 +62,8 @@ struct Args {
     budget: Option<usize>,
     allow: Vec<String>,
     model: Option<String>,
+    /// Seconds this `-p` run may take: paces the reasoning effort and adds time notes (policy.rs).
+    deadline: Option<u64>,
     version: bool,
 }
 
@@ -82,6 +82,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "--allow" => a.allow.push(value()?),
             "--model" => a.model = Some(value()?),
+            "--deadline" => {
+                let v = value()?;
+                a.deadline = Some(v.parse().ok().filter(|&s| s > 0).ok_or_else(|| format!("--deadline needs a number of seconds above 0, not `{v}`"))?);
+            }
             "--version" => a.version = true,
             "--resume" => a.resume = Some(it.next_if(|t| !t.starts_with('-')).cloned()),
             _ => return Err(format!("unknown flag {flag}")),
@@ -249,6 +253,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, String> {
+    let started = Instant::now(); // `--deadline` counts from here
     let args = parse_args(&env::args().skip(1).collect::<Vec<_>>()).map_err(|e| format!("{e}\n{USAGE}"))?;
     if args.version {
         println!("xolotl {}", env!("CARGO_PKG_VERSION"));
@@ -302,7 +307,7 @@ fn run() -> Result<ExitCode, String> {
         reasoning_effort: cfg.reasoning_effort,
     });
     Ok(match &args.prompt {
-        Some(task) => headless(&ctx, session, startup, &mut model, mode, task),
+        Some(task) => headless(&ctx, session, startup, &mut model, mode, task, args.deadline.map(|s| Deadline::new(started, Duration::from_secs(s)))),
         None => {
             if args.resume.is_some() {
                 println!("resumed {}", session.meta.id);
@@ -373,12 +378,12 @@ fn tool_ctx(ctx: &Ctx, s: &Session) -> ToolCtx {
 
 /// `-p`: one request, every event as a JSON line on stdout (from `session.events[startup..]`, appended before the
 /// request). Exit 0 when the agent finished, 2 at the step limit, 1 otherwise.
-fn headless(ctx: &Ctx, session: Session, startup: usize, model: &mut ZaiClient, mode: Mode, task: &str) -> ExitCode {
+fn headless(ctx: &Ctx, session: Session, startup: usize, model: &mut ZaiClient, mode: Mode, task: &str, deadline: Option<Deadline>) -> ExitCode {
     eprintln!("session: {}", session.dir.display());
     let mut ui = headless_ui(io::stdout(), &session.events[startup..]);
     let perms = Perms::new(mode, true, session.dir.clone(), ctx.allow.clone());
     let tools = tool_ctx(ctx, &session);
-    let mut agent = Agent { session, model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
+    let mut agent = Agent { session, model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env, deadline };
     let (status, code) = match agent.run_request(task) {
         Outcome::Done => ("done", 0),
         Outcome::StepLimit => ("step_limit", 2),
@@ -501,7 +506,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
                 term.notice(UNWRITABLE);
                 continue;
             }
-            let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
+            let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env, deadline: None };
             let outcome = agent.run_request(&line);
             Agent { session, perms, tools, .. } = agent;
             println!();
@@ -549,7 +554,7 @@ fn repl(ctx: &Ctx, mut session: Session, model: &mut ZaiClient, mode: Mode) -> E
             }
             Slash::Compact(focus) => {
                 CANCEL.store(false, Ordering::SeqCst); // a Ctrl+C from an earlier request must not cut the summary call
-                let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env };
+                let mut agent = Agent { session, model: &mut *model, ui: &mut term, perms, tools, budget: ctx.budget, cancel: &CANCEL, api_key_env: &ctx.api_key_env, deadline: None };
                 let result = agent.compact(focus.as_deref());
                 Agent { session, perms, tools, .. } = agent;
                 if let Err(e) = result {
@@ -665,7 +670,7 @@ mod tests {
     fn args_full() {
         let a = parse_args(&strs(&[
             "-p", "fix it", "--mode", "yolo", "--allow", "cargo test", "--allow", "ls", "--budget", "50000", "--cwd", "D:/x", "--model", "m",
-            "--resume", "abc",
+            "--resume", "abc", "--deadline", "840",
         ]))
         .unwrap();
         assert_eq!(a.prompt.as_deref(), Some("fix it"));
@@ -675,6 +680,7 @@ mod tests {
         assert_eq!(a.cwd, Some(PathBuf::from("D:/x")));
         assert_eq!(a.model.as_deref(), Some("m"));
         assert_eq!(a.resume, Some(Some("abc".to_string())));
+        assert_eq!(a.deadline, Some(840));
         assert_eq!(parse_args(&[]).unwrap(), Args::default());
     }
 
@@ -686,6 +692,10 @@ mod tests {
         assert_eq!(parse_args(&strs(&["--x"])), Err("unknown flag --x".to_string()));
         assert!(parse_args(&strs(&["--mode", "bad"])).is_err());
         assert!(parse_args(&strs(&["--budget", "abc"])).is_err());
+        for bad in ["abc", "0", "-5", "1.5"] {
+            assert!(parse_args(&strs(&["--deadline", bad])).is_err(), "{bad}");
+        }
+        assert!(parse_args(&strs(&["--deadline"])).is_err());
         assert!(parse_args(&strs(&["-p"])).is_err());
         assert!(parse_args(&strs(&["--allow"])).is_err());
     }
