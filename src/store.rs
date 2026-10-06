@@ -62,7 +62,7 @@ pub enum Kind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens_before: Option<u64>,
     },
-    /// reason: completion_check|repeat|empty
+    /// reason: completion_check|repeat|empty|time|think_cap
     Nudge { reason: String, text: String },
     /// during: stream|tool
     Interrupt {

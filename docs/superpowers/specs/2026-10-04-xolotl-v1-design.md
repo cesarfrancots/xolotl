@@ -252,7 +252,7 @@ Every event is one compact JSON line with `seq`, `t_ms` (unix milliseconds) and 
 | `tool_result` | `call_id, name, ok, output` (capped), `artifact?, bytes, duration_ms, exit_code?` |
 | `permission` | `call_id, decision: allow\|deny\|always, by: user\|rule\|mode` |
 | `compaction` | `stage: 1\|2, upto_seq` (stage 1), `from_seq, to_seq, summary_path, summary, tokens_before` (stage 2; `summary` is the full text placed in the view) |
-| `nudge` | `reason: completion_check\|repeat\|empty, text`. A harness-written message; `build_view` renders it as a user-role message. |
+| `nudge` | `reason: completion_check\|repeat\|empty\|time\|think_cap, text`. A harness-written message; `build_view` renders it as a user-role message. |
 | `interrupt` | `during: stream\|tool, call_id?` |
 | `error` | `kind, message, retry` |
 | `session_end` | `status` |

@@ -27,6 +27,11 @@ pub struct Limits {
     pub effort_low_below_s: u64,
     /// With a deadline: the percentages of the budget left at which a `time` nudge is added (descending).
     pub time_note_pct: [u64; 2],
+    /// With a deadline: a call that has reasoned for `max(think_cap_min_s, think_cap_pct % of the time left)` with no
+    /// content or tool call yet is cut. At most `think_cap_fires` cuts per request.
+    pub think_cap_min_s: u64,
+    pub think_cap_pct: u32,
+    pub think_cap_fires: usize,
 }
 
 pub const LIMITS: Limits = Limits {
@@ -44,10 +49,17 @@ pub const LIMITS: Limits = Limits {
     agents_md_max: 20_000,
     toc_user_chars: 500,
     // ponytail: read off the TB2 hard-set traces (~45 tokens/s; a max-effort call thinks 8-24k tokens = 3-10 min), not tuned.
-    // Ceiling: one step function for every task and a call already in flight keeps its effort; upgrade: a per-call thinking cap.
+    // Ceiling: one step function for every task and a call already in flight keeps its effort (think_cap below bounds one call).
     effort_medium_below_s: 1000,
     effort_low_below_s: 240,
     time_note_pct: [50, 20],
+    // ponytail: read off the r1 traces: the one runaway thought (polyglot-rust-c: 840 s, no tool call) vs the longest productive
+    // ones (287-416 s, against caps of 376-628 s). Ceiling: one rule for every task, so a productive thought past the cap loses
+    // its tail (its partial reasoning is kept), and only silent reasoning is timed, so many 140 s calls still add up.
+    // Upgrade: a cap learned per task or stage, or loop detection on the reasoning stream.
+    think_cap_min_s: 150,
+    think_cap_pct: 50,
+    think_cap_fires: 2,
 };
 
 /// Resend each assistant turn's `reasoning_content` verbatim (docs/glm-api-notes.md, decision 2: without it the model loses its own thinking).
@@ -169,6 +181,26 @@ pub fn time_note(tier: usize, remaining: Duration) -> String {
     } else {
         format!("Time check: {left} left. Wrap up: get the deliverable into a working state, verify it once, and stop. No new designs or refactors.")
     }
+}
+
+/// How long one call may reason with no content or tool call yet (`--deadline`), given the time left when it starts:
+/// a runaway thought is cut early enough to leave time to act, a productive one in a long budget is not.
+pub fn think_cap(remaining: Duration) -> Duration {
+    Duration::from_secs(LIMITS.think_cap_min_s).max(remaining * LIMITS.think_cap_pct / 100)
+}
+
+/// The `think_cap` nudge after a thought of `thought` was cut. The partial reasoning stays in the history, so the note
+/// says to act on it, not to start over.
+pub fn think_note(thought: Duration) -> String {
+    let spent = match (thought.as_secs() + 30) / 60 {
+        0 | 1 => "about 1 minute".to_string(),
+        m => format!("about {m} minutes"),
+    };
+    format!(
+        "Time check: that thought ran {spent} without a tool call or an answer, so it was cut off; your reasoning so far is kept. \
+         Act on it now: write the simplest working version of the deliverable, run it to find out, and refine afterwards. \
+         Do not restart the analysis."
+    )
 }
 
 /// What the model sees of a tool result. `bash` keeps head and tail (errors and summaries sit at the end); everything else keeps the head.
@@ -619,6 +651,23 @@ mod tests {
         assert!(time_note(1, s(60)).contains("about 1 minute left"));
         assert!(time_note(1, s(0)).starts_with("Time check: under a minute left"));
         assert!(time_note(1, s(100)).contains("Wrap up"));
+    }
+
+    #[test]
+    fn think_cap_is_half_the_time_left_with_a_floor() {
+        let s = Duration::from_secs;
+        // the floor holds near the end, half the time left holds in a long budget
+        assert_eq!([840, 400, 300, 100, 0].map(|n| think_cap(s(n))), [s(420), s(200), s(150), s(150), s(150)]);
+        assert_eq!(think_cap(s(1740)), s(870));
+    }
+
+    #[test]
+    fn think_note_says_how_long_the_thought_ran() {
+        let s = Duration::from_secs;
+        let note = think_note(s(420));
+        assert!(note.contains("about 7 minutes") && note.contains("kept") && note.contains("simplest working version"), "{note}");
+        assert!(think_note(s(150)).contains("about 3 minutes"), "rounds to the nearest minute");
+        assert!(think_note(s(5)).contains("about 1 minute"));
     }
 
     #[test]

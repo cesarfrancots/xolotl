@@ -62,6 +62,8 @@ pub enum Delta<'a> { Text(&'a str), Reasoning(&'a str), Notice(String) }
 pub struct Reply {
     pub text: String, pub reasoning: String, pub tool_calls: Vec<ToolCall>,
     pub usage: Usage, pub finish_reason: String, pub interrupted: bool,
+    /// The client's thinking cap ended the call (`interrupted` stays for Ctrl+C). Only ever with reasoning and no text or tool calls.
+    pub capped: bool,
     /// Milliseconds from the first reasoning token to the first content or tool-call token (or to the end of the call
     /// if none came; 0 without reasoning). `None`: the model does not measure it.
     pub think_ms: Option<u64>,
@@ -107,21 +109,30 @@ pub trait Model {
 
     /// Limits the reasoning effort of the calls that follow (never raises it); `None` lifts the limit. Ignored by default.
     fn cap_effort(&mut self, _cap: Option<&str>) {}
+
+    /// Ends a call that reasons for this long before its first content or tool-call token, with `Reply::capped` and the
+    /// partial reasoning; applies to the calls that follow, `None` lifts it. Ignored by default.
+    fn think_cap(&mut self, _cap: Option<Duration>) {}
 }
 
-/// Replays canned replies in order and records each request as `(messages, tool count)`, and each effort cap it was given.
+/// Replays canned replies in order and records each request as `(messages, tool count)`, and each effort and thinking cap it was given.
 #[allow(dead_code)] // test double: only the tests use it
-pub struct Scripted { replies: VecDeque<Result<Reply, LlmError>>, pub requests: Vec<(Vec<Message>, usize)>, pub caps: Vec<Option<String>> }
+pub struct Scripted {
+    replies: VecDeque<Result<Reply, LlmError>>, pub requests: Vec<(Vec<Message>, usize)>,
+    pub caps: Vec<Option<String>>, pub think_caps: Vec<Option<Duration>>,
+}
 
 #[allow(dead_code)] // test double: only the tests use it
 impl Scripted {
     pub fn new(replies: Vec<Result<Reply, LlmError>>) -> Self {
-        Scripted { replies: replies.into(), requests: Vec::new(), caps: Vec::new() }
+        Scripted { replies: replies.into(), requests: Vec::new(), caps: Vec::new(), think_caps: Vec::new() }
     }
 }
 
 impl Model for Scripted {
     fn cap_effort(&mut self, cap: Option<&str>) { self.caps.push(cap.map(String::from)); }
+
+    fn think_cap(&mut self, cap: Option<Duration>) { self.think_caps.push(cap); }
 
     fn complete(&mut self, messages: &[Message], tools: &[Value],
                 on: &mut dyn FnMut(Delta), _cancel: &AtomicBool) -> Result<Reply, LlmError> {
@@ -145,7 +156,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often `attempt` wakes to check `cancel` while waiting for the worker.
 const POLL: Duration = Duration::from_millis(100);
 
-pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent, idle: Duration, effort_cap: Option<String> }
+pub struct ZaiClient { cfg: ZaiConfig, agent: ureq::Agent, idle: Duration, effort_cap: Option<String>, think_cap: Option<Duration> }
 
 /// What the worker thread reports back to `attempt`.
 enum Msg {
@@ -160,7 +171,7 @@ impl ZaiClient {
         // No global/body timeout: a stream may legitimately run for minutes; `attempt` enforces the idle limit.
         let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder()
             .http_status_as_error(false).timeout_connect(Some(Duration::from_secs(30))).build());
-        ZaiClient { cfg, agent, idle: IDLE_TIMEOUT, effort_cap: None }
+        ZaiClient { cfg, agent, idle: IDLE_TIMEOUT, effort_cap: None, think_cap: None }
     }
 
     /// The configured reasoning effort, lowered to the current cap.
@@ -200,6 +211,16 @@ impl ZaiClient {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 state.reply.interrupted = true;
+                state.reply.think_ms = Some(think.ms());
+                return Ok(finish(std::mem::take(state)));
+            }
+            // Reasoning only so far, for the whole cap: end the call like a cancel does (the worker is simply abandoned) and keep
+            // what was thought. Never once content or a tool call has begun, and never before any reasoning (a silent server is
+            // the idle limit's business, and a capped reply always has reasoning to keep).
+            if let (Some(cap), Some(start), None) = (self.think_cap, think.start, think.end)
+                && start.elapsed() >= cap
+            {
+                state.reply.capped = true;
                 state.reply.think_ms = Some(think.ms());
                 return Ok(finish(std::mem::take(state)));
             }
@@ -306,6 +327,8 @@ impl Model for ZaiClient {
     }
 
     fn cap_effort(&mut self, cap: Option<&str>) { self.effort_cap = cap.map(String::from); }
+
+    fn think_cap(&mut self, cap: Option<Duration>) { self.think_cap = cap; }
 }
 
 fn request_body(cfg: &ZaiConfig, messages: &[Message], tools: &[Value]) -> Value {
@@ -763,6 +786,59 @@ mod tests {
         assert_eq!(run(Some("max"), Some("medium")).as_deref(), Some("medium"));
         assert_eq!(run(Some("low"), Some("medium")).as_deref(), Some("low")); // a cap never raises
         assert_eq!(run(None, None), None); // nothing sent: the API default applied
+    }
+    const TEXT_CHUNK: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n";
+    const CALL_CHUNK: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n";
+    const NO_DONE: &str = "stream ended before [DONE]"; // what a stream that is simply left to run out reports
+
+    #[test] fn thinking_cap_cuts_a_silent_thought_and_keeps_it() {
+        let mut c = server(THINKING, Duration::from_secs(3));
+        c.think_cap(Some(Duration::from_millis(400)));
+        let t = Instant::now();
+        let r = c.complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        let waited = t.elapsed();
+        assert!(r.capped && !r.interrupted);
+        assert_eq!((r.reasoning.as_str(), r.text.as_str(), r.tool_calls.len()), ("half a thought", "", 0));
+        assert!(waited >= Duration::from_millis(400) && waited < Duration::from_secs(2), "{waited:?}"); // not at once, not at the server's pace
+        assert!(r.think_ms.is_some_and(|ms| (400..2000).contains(&ms)), "{:?}", r.think_ms);
+    }
+    #[test] fn no_cap_means_no_cut() {
+        // the same stream with no cap runs until the server ends it
+        let e = server(THINKING, Duration::from_millis(700)).complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(e, LlmError::Network(NO_DONE.into()));
+    }
+    #[test] fn thinking_cap_never_fires_once_content_or_a_tool_call_has_started() {
+        for first_output in [TEXT_CHUNK, CALL_CHUNK] {
+            let mut c = server_parts(vec![(THINKING, Duration::ZERO), (first_output, Duration::from_millis(900))]);
+            c.think_cap(Some(Duration::from_millis(300))); // long gone by the time the server ends the stream
+            let e = c.complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+            assert_eq!(e, LlmError::Network(NO_DONE.into()), "{first_output}");
+        }
+    }
+    #[test] fn thinking_cap_waits_for_reasoning_and_leaves_stalls_to_the_idle_limit() {
+        // a silent server is no thought: the cap stays out of it and only the cancel ends the call
+        let mut c = server("", Duration::from_secs(3));
+        c.think_cap(Some(Duration::from_millis(100)));
+        let cancel = AtomicBool::new(false);
+        let r = std::thread::scope(|s| {
+            s.spawn(|| { std::thread::sleep(Duration::from_millis(600)); cancel.store(true, Ordering::Relaxed); });
+            c.complete(&[], &[], &mut |_| {}, &cancel)
+        }).unwrap();
+        assert!(r.interrupted && !r.capped && r.reasoning.is_empty());
+        // reasoning, then silence longer than the idle limit but shorter than the cap: the idle limit wins as before
+        let mut c = server(THINKING, Duration::from_secs(3));
+        c.idle = Duration::from_millis(300);
+        c.think_cap(Some(Duration::from_secs(60)));
+        let e = c.complete(&[], &[], &mut |_| {}, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(e, LlmError::Network("stream stalled".into()));
+    }
+    #[test] fn cancel_wins_over_the_thinking_cap() {
+        // Ctrl+C and the cap due at the same moment: the call is interrupted, not capped
+        let mut c = server(THINKING, Duration::from_secs(3));
+        c.think_cap(Some(Duration::ZERO));
+        let cancel = AtomicBool::new(false);
+        let r = c.complete(&[], &[], &mut |d| if let Delta::Reasoning(_) = d { cancel.store(true, Ordering::Relaxed) }, &cancel).unwrap();
+        assert_eq!((r.interrupted, r.capped, r.reasoning.as_str()), (true, false, "half a thought"));
     }
     #[test] fn silent_server_trips_idle_timeout_and_retries() {
         let mut c = server("", Duration::from_secs(3));
