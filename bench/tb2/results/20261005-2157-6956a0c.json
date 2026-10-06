@@ -1,0 +1,420 @@
+{
+  "run_id": "20261005-2157-6956a0c",
+  "job_name": "20261005-2157-6956a0c",
+  "reparsed": true,
+  "parser_git_sha": "6956a0c56114a8e60723d68ca928304c5ab4f20a",
+  "started": "2026-10-05T21:58:14-06:00",
+  "git_sha": "6956a0c",
+  "dirty": null,
+  "harbor_version": null,
+  "binary_sha256": "a52e375ef75f31ac0350c936fd5cc3856e5c29861ef2b75c786f11da23c1d36f",
+  "dataset": "terminal-bench@2.0",
+  "model": "zai/glm-5.3-flash",
+  "concurrency": 2,
+  "note": "tb2-hard r1: --deadline effort pacing + SIGINT stop (feal+mcmc re-run via harbor jobs resume after a PC shutdown)",
+  "partial": false,
+  "harbor_exit_code": null,
+  "xolotl_version": "xolotl 0.1.0",
+  "policy_hash": "789707559ce73db4",
+  "tasks": [
+    "gpt2-codegolf",
+    "make-doom-for-mips",
+    "polyglot-rust-c",
+    "torch-pipeline-parallelism",
+    "torch-tensor-parallelism",
+    "write-compressor",
+    "feal-differential-cryptanalysis",
+    "make-mips-interpreter",
+    "path-tracing",
+    "protein-assembly",
+    "mcmc-sampling-stan",
+    "llm-inference-batching-scheduler"
+  ],
+  "tasks_hash": "d4fbd5cc9a7b",
+  "trials": [
+    {
+      "task": "feal-differential-cryptanalysis",
+      "trial": "feal-differential-cryptanalysis__WurUkt9",
+      "task_checksum": "20fe217750fdfbd09b32e9ccdb59c642b41352d99c43345cc8786ff0c6e56bb0",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 317848,
+        "completion": 13340,
+        "cached": 282688
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 13,
+        "tool_calls": 12,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 331.725,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "gpt2-codegolf",
+      "trial": "gpt2-codegolf__CXBp3X7",
+      "task_checksum": "fd54e192391e26b04b5845c8492e440c7535da096d1c4191542981e2115102a2",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 230204,
+        "completion": 18387,
+        "cached": 208064
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 14,
+        "tool_calls": 13,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 507.075,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "llm-inference-batching-scheduler",
+      "trial": "llm-inference-batching-scheduler__sVC2MJZ",
+      "task_checksum": "2fac67e7081c351e76d4968d2ebaf0bf9a998387a3ba01e81c2116872ea08297",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 741376,
+        "completion": 41162,
+        "cached": 664128
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 20,
+        "tool_calls": 22,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 1184.239,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "make-doom-for-mips",
+      "trial": "make-doom-for-mips__j4K9n8D",
+      "task_checksum": "4d1943b82cc21f144230f3caff40d5c2da03d8808f6d22450ff6a66b6336c7b0",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 1702962,
+        "completion": 31526,
+        "cached": 1602752
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 48,
+        "tool_calls": 70,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.311,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "make-mips-interpreter",
+      "trial": "make-mips-interpreter__ZvQsPw5",
+      "task_checksum": "b3b6e22b63fa2d3a10d1a6fb4154aea02856ef9a7c3e4ee6f7e9680a6e663a33",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 4306247,
+        "completion": 70542,
+        "cached": 4029056
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 64,
+        "tool_calls": 82,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 1740.373,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "mcmc-sampling-stan",
+      "trial": "mcmc-sampling-stan__4GHgFa4",
+      "task_checksum": "55a958e8fec180008c48f470f8f548d178c71576ddb4a04b112b27b676a4c0b9",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 639653,
+        "completion": 22999,
+        "cached": 581312
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 31,
+        "tool_calls": 37,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 1160.01,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "path-tracing",
+      "trial": "path-tracing__ZiBoHxr",
+      "task_checksum": "24bd4a8019eb75d889190d95339961caf186135648d706d97b775a945c9fb946",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 1772655,
+        "completion": 53988,
+        "cached": 1559936
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 25,
+        "tool_calls": 32,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 1092.647,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "polyglot-rust-c",
+      "trial": "polyglot-rust-c__Gum6R7U",
+      "task_checksum": "288b753a0e03355abb0128b5d57813bced03ac00bc8778e5f504595c4a2b7a63",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 0,
+        "completion": 0,
+        "cached": 0
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 1,
+        "tool_calls": 0,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.187,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "protein-assembly",
+      "trial": "protein-assembly__xdeJrkP",
+      "task_checksum": "bd37643122db7a5f600d7e673986a626de49901f4c848dd469f0fe86b678c9ba",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 1664162,
+        "completion": 52110,
+        "cached": 1550976
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 37,
+        "tool_calls": 38,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 1193.042,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 1800.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "torch-pipeline-parallelism",
+      "trial": "torch-pipeline-parallelism__b3EKsSB",
+      "task_checksum": "94d02b50410ac00ea4febcb025f7069106c8740e2db6ee1b015e857f0d6b86b9",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 325816,
+        "completion": 13729,
+        "cached": 303808
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 26,
+        "tool_calls": 24,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 459.604,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "torch-tensor-parallelism",
+      "trial": "torch-tensor-parallelism__4qKocra",
+      "task_checksum": "bea57c7799a4d37c822b86945746b6ddd4382d34f2bb92f52b8ca16a6fa29122",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 230379,
+        "completion": 7292,
+        "cached": 215616
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 32,
+        "tool_calls": 30,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 364.37,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    },
+    {
+      "task": "write-compressor",
+      "trial": "write-compressor__Tw8hoLo",
+      "task_checksum": "9c4ca76435bf61d92f9afb536325db16116067b869f87ddae13050155df69d83",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 264643,
+        "completion": 29309,
+        "cached": 210048
+      },
+      "policy_hash": "789707559ce73db4",
+      "metadata": {
+        "model_calls": 15,
+        "tool_calls": 16,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "789707559ce73db4",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.198,
+      "xolotl_version": "xolotl 0.1.0",
+      "agent_timeout_sec": 900.0,
+      "timeout_source": "task.toml"
+    }
+  ],
+  "summary": {
+    "pass": 8,
+    "total": 12,
+    "infra": 0,
+    "pass_rate": 0.667,
+    "tokens": {
+      "prompt": 12195945,
+      "completion": 354384,
+      "cached": 11208384
+    },
+    "median_agent_time_s": 840.255
+  }
+}
