@@ -1,12 +1,16 @@
+import asyncio
 import base64
 import contextlib
 import hashlib
+import importlib
 import io
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,6 +40,32 @@ STREAM = [
     assistant(200, 30, 0),
 ]
 
+# A task.toml shaped like TB2's (the layout Harbor caches: <task>/task.toml next to <task>/environment/)
+TASK_TOML = """version = "1.0"
+
+[metadata]
+difficulty = "hard"
+
+[verifier]
+timeout_sec = 1200.0
+
+[agent]
+timeout_sec = {timeout}
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+"""
+
+
+def make_task(root: Path, timeout: str | None = "1800.0", toml: str | None = None) -> Path:
+    """<root>/task/{task.toml, environment/}; returns the environment dir, which is what Harbor hands the agent."""
+    env = root / "task" / "environment"
+    env.mkdir(parents=True)
+    if timeout is not None or toml is not None:
+        (root / "task" / "task.toml").write_text(toml if toml is not None else TASK_TOML.format(timeout=timeout), encoding="utf-8")
+    return env
+
 
 class CoreTests(unittest.TestCase):
     def test_model_arg(self):
@@ -48,6 +78,38 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(core.timeout_budget(60), 60)
         self.assertEqual(core.timeout_budget(30), 60)
         self.assertEqual(core.timeout_budget(None), 840)
+        self.assertEqual(core.timeout_budget(1800.0), 1740)  # task.toml holds floats; the shell wants an int
+
+    def test_task_agent_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(core.task_agent_timeout(make_task(Path(d))), 1800.0)
+        for timeout in ("900", "900.5"):
+            with tempfile.TemporaryDirectory() as d:
+                self.assertEqual(core.task_agent_timeout(make_task(Path(d), timeout)), float(timeout))
+        # no task.toml, a garbled one, or no usable [agent].timeout_sec: None, never an exception
+        bad = {"missing file": None, "not toml": "{{{", "no [agent]": "[verifier]\ntimeout_sec = 5\n",
+               "no timeout_sec": "[agent]\nuser = 'root'\n", "agent is a number": "agent = 3\n",
+               "zero": TASK_TOML.format(timeout="0"), "negative": TASK_TOML.format(timeout="-60"),
+               "string": TASK_TOML.format(timeout='"900"'), "bool": TASK_TOML.format(timeout="true")}
+        for label, toml in bad.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                self.assertIsNone(core.task_agent_timeout(make_task(Path(d), None, toml)))
+        self.assertIsNone(core.task_agent_timeout(Path("/does/not/exist/environment")))
+
+    def test_resolve_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = make_task(Path(d))
+            self.assertEqual(core.resolve_timeout(None, env), {"agent_timeout_sec": 1800.0, "source": "task.toml", "budget_s": 1740})
+            # an explicit --ak agent_timeout_sec beats the task's own value
+            self.assertEqual(core.resolve_timeout(600, env), {"agent_timeout_sec": 600.0, "source": "kwarg", "budget_s": 540})
+            self.assertEqual(core.resolve_timeout(30, env)["budget_s"], 60)  # the 60 s floor still applies
+            for bad in (0, -5, "abc", True, float("nan")):  # a typo'd override fails loudly, never silently
+                with self.subTest(bad), self.assertRaises(ValueError):
+                    core.resolve_timeout(bad, env)
+        with tempfile.TemporaryDirectory() as d:  # no task.toml found: the old default, but labelled so it can be flagged
+            self.assertEqual(core.resolve_timeout(None, make_task(Path(d), None)),
+                             {"agent_timeout_sec": 900, "source": "default", "budget_s": 840})
+        self.assertEqual(core.resolve_timeout(None, None)["source"], "default")
 
     def test_command_base64_roundtrip(self):
         instruction = 'say "hi"; $(rm -rf /) `x`\nline2 — ünïcode'
@@ -109,6 +171,70 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(core.read_api_key(), "k-from-env")
 
 
+class AgentTests(unittest.TestCase):
+    """agent.py imports Harbor, which only exists in its own uv interpreter: stub the three modules it imports so the
+    real XolotlAgent.run() is exercised under plain `py`."""
+
+    @contextlib.contextmanager
+    def agent_module(self):
+        class Base:  # the slice of BaseInstalledAgent that XolotlAgent touches
+            def __init__(self, logs_dir=None, model_name=None, **kwargs):
+                self.logs_dir, self.model_name, self.logger, self.calls = Path(logs_dir), model_name, mock.Mock(), []
+
+            async def exec_as_agent(self, environment, cmd, env=None):
+                self.calls.append((cmd, env))
+
+        stubs = {}
+        for name, attr in (("harbor.agents.installed.base", "BaseInstalledAgent"),
+                           ("harbor.environments.base", "BaseEnvironment"), ("harbor.models.agent.context", "AgentContext")):
+            stubs[name] = types.ModuleType(name)
+            setattr(stubs[name], attr, Base if attr == "BaseInstalledAgent" else object)
+        with mock.patch.dict(sys.modules, stubs):  # on exit sys.modules is restored, so the stub-bound module isn't kept
+            yield importlib.import_module("bench.tb2.xolotl_harbor.agent")
+
+    def run_agent(self, env_dir: Path | None, logs: Path, **kwargs):
+        with self.agent_module() as mod, mock.patch.object(core, "read_api_key", return_value="fake-key"):
+            agent = mod.XolotlAgent(logs_dir=logs, model_name="zai/glm-5.3-flash", **kwargs)
+            asyncio.run(agent.run("do it", types.SimpleNamespace(environment_dir=env_dir), None))
+        return agent.calls
+
+    def test_each_task_gets_its_own_timeout(self):
+        for task_timeout, budget in (("900.0", 840), ("1800.0", 1740)):
+            with self.subTest(task_timeout), tempfile.TemporaryDirectory() as d:
+                logs = Path(d) / "agent"
+                logs.mkdir()
+                (cmd, env), = self.run_agent(make_task(Path(d), task_timeout), logs)
+                self.assertIn(f"timeout -k 5 {budget} /installed-agent/xolotl", cmd)
+                self.assertEqual(env, {"ZAI_API_KEY": "fake-key"})  # the key only via env=, never in the command
+                self.assertNotIn("fake-key", cmd)
+                rec = json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))
+                self.assertEqual(rec, {"agent_timeout_sec": float(task_timeout), "source": "task.toml", "budget_s": budget})
+
+    def test_override_and_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            logs = Path(d) / "agent"
+            logs.mkdir()
+            (cmd, _), = self.run_agent(make_task(Path(d)), logs, agent_timeout_sec=600)  # --ak agent_timeout_sec=600
+            self.assertIn("timeout -k 5 540 ", cmd)
+            self.assertEqual(json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))["source"], "kwarg")
+        with tempfile.TemporaryDirectory() as d:  # no task.toml reachable: the default, recorded as such
+            logs = Path(d) / "agent"
+            logs.mkdir()
+            (cmd, _), = self.run_agent(make_task(Path(d), None), logs)
+            self.assertIn("timeout -k 5 840 ", cmd)
+            self.assertEqual(json.loads((logs / "agent_timeout.json").read_text(encoding="utf-8"))["source"], "default")
+
+    def test_bad_override_fails_at_construction(self):
+        with self.agent_module() as mod, self.assertRaises(ValueError):
+            mod.XolotlAgent(logs_dir=Path("x"), model_name="zai/m", agent_timeout_sec="soon")
+
+    def test_unwritable_record_does_not_stop_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = self.run_agent(make_task(Path(d)), Path(d) / "no-such-logs-dir")  # the record can't be written
+            self.assertEqual(len(calls), 1)
+            self.assertIn("timeout -k 5 1740 ", calls[0][0])
+
+
 class WrapperTests(unittest.TestCase):
     def test_parse_job_statuses(self):
         trials = {t["task"]: t for t in run.parse_job(JOB)}
@@ -126,6 +252,30 @@ class WrapperTests(unittest.TestCase):
         # a trial that never ran the agent (no agent files, no timing) still parses
         self.assertIsNone(trials["t-setup"]["agent_time_s"])
         self.assertEqual(trials["t-setup"]["tokens"], {"prompt": 0, "completion": 0, "cached": 0})
+
+    def test_parse_trial_records_agent_timeout(self):
+        trials = {t["task"]: t for t in run.parse_job(JOB)}
+        self.assertEqual((trials["t-pass"]["agent_timeout_sec"], trials["t-pass"]["timeout_source"]), (1800.0, "task.toml"))
+        self.assertEqual((trials["t-fail"]["agent_timeout_sec"], trials["t-fail"]["timeout_source"]), (900.0, "task.toml"))
+        # no record (a job from before it existed, or a trial that never reached run()): unknown, not a guess
+        self.assertEqual((trials["t-exit2"]["agent_timeout_sec"], trials["t-exit2"]["timeout_source"]), (None, None))
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d) / "t-pass__a1"
+            shutil.copytree(JOB / "t-pass__a1", t)
+            for junk in ("not json", "[1]", '{"agent_timeout_sec": "soon", "source": 7}', '{"agent_timeout_sec": true}'):
+                (t / "agent" / "agent_timeout.json").write_text(junk, encoding="utf-8")
+                got = run.parse_trial(t)
+                self.assertEqual((got["agent_timeout_sec"], got["timeout_source"]), (None, None), junk)
+
+    def test_summary_flags_default_timeout(self):
+        trial = {"task": "t", "status": "pass", "reward": 1.0, "agent_time_s": 5.0, "infra_reason": "", "exit_code": 0,
+                 "tokens": {"prompt": 1, "completion": 1, "cached": 0}, "agent_timeout_sec": 900, "timeout_source": "default"}
+        result = {"trials": [trial], "summary": run.summarize([trial])}
+        for source, flagged in (("default", True), ("task.toml", False), ("kwarg", False), (None, False)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                run._print_summary(result | {"trials": [trial | {"timeout_source": source}]}, Path("r.json"))
+            self.assertEqual("task.toml was not found" in out.getvalue(), flagged, source)
 
     def test_summarize_excludes_infra(self):
         s = run.summarize(run.parse_job(JOB))
@@ -239,6 +389,8 @@ class WrapperTests(unittest.TestCase):
             self.assertEqual((data["summary"]["pass"], data["summary"]["total"], data["summary"]["infra"]), (2, 5, 2))
             self.assertEqual(data["tasks_hash"], run.tasks_hash(["t-pass", "t-fail", "t-exit2", "t-setup", "t-nosession"]))
             self.assertEqual({t["task"]: t["task_checksum"] for t in data["trials"]}["t-pass"], "checksum-of-t-pass")
+            self.assertEqual({t["task"]: t["agent_timeout_sec"] for t in data["trials"]},
+                             {"t-pass": 1800.0, "t-fail": 900.0, "t-exit2": None, "t-setup": None, "t-nosession": None})
             self.assertIn("binary_sha256", data)
             rows = (results / "HISTORY.md").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(rows), 3)  # header, separator, one row
@@ -266,6 +418,13 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual((len(smoke), len(subset)), (2, 15))
         self.assertEqual(len(set(subset)), 15)
         self.assertTrue(all(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", t) for t in smoke + subset))
+
+    def test_hard_task_list(self):
+        hard = run.read_task_names(HERE / "tasks-hard.txt")
+        self.assertEqual(len(hard), 12)
+        self.assertEqual(len(set(hard)), 12)
+        self.assertTrue(all(re.fullmatch(r"[a-z0-9][a-z0-9.-]*", t) for t in hard))
+        self.assertFalse(set(hard) & set(run.read_task_names(HERE / "tasks.txt")))  # unseen: none already in the fixed subset
 
     def test_key_not_in_our_argv(self):  # Harbor itself puts it in its `docker compose exec` argv while a trial runs
         cmd = run.harbor_command("harbor", ["a", "b"], Path("/x/xolotl"), Path("/jobs"), "job1", 1)

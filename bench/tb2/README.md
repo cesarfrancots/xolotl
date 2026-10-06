@@ -19,8 +19,11 @@ Windows 11 + Git Bash is the primary platform. Run everything from the repo root
 py bench/tb2/run.py --smoke --note "tb2 smoke"        # the 2 smoke tasks (smoke.txt)
 py bench/tb2/run.py --note "tb2 v1 baseline"          # the fixed 15-task subset (tasks.txt)
 py bench/tb2/run.py --task fix-git --task regex-log   # any TB2 tasks by name
+py bench/tb2/run.py --tasks-file bench/tb2/tasks-hard.txt -n 2 --note "..."   # the 12 unseen hard tasks (see Task sets)
 py bench/tb2/run.py --tasks-file my.txt               # your own list: one name per line, # comments
 py bench/tb2/run.py --smoke --dry-run                 # print the Harbor command (key redacted), let Harbor validate task names; no run, no build
+                                                      # (still needs the Docker daemon up, but pulls and runs nothing; it silently drops
+                                                      # unknown task names, so check that "N trial(s)" equals your task count)
 py bench/tb2/run.py --reparse bench/tb2/jobs/<run_id> --note "..."   # re-derive results from a finished job folder (see Results)
 py -m unittest bench.tb2.test_tb2 -v                  # tests for the pure helpers
 ```
@@ -45,11 +48,31 @@ PYTHONPATH=bench/tb2 harbor run -d terminal-bench@2.0 -a xolotl_harbor.agent:Xol
 
 `XolotlAgent.install()` uploads the binary to `/installed-agent/xolotl` (kwarg `binary`, else env `XOLOTL_LINUX_BIN`);
 `run()` executes one shell command whose instruction is base64-encoded, so quoting can't break it. Xolotl runs under
-`timeout -k 5 <task timeout - 60 s>` (SIGKILL 5 s after SIGTERM, so it is guaranteed gone; default 840 s; Harbor doesn't
-tell an agent its task's timeout, so pass `--ak agent_timeout_sec=N` for a task whose timeout isn't 900 s). The command
-always exits 0: Xolotl's own exit code goes
+`timeout -k 5 <task timeout - 60 s>` (SIGKILL 5 s after SIGTERM, so it is guaranteed gone; floor 60 s; see Timeouts). The
+command always exits 0: Xolotl's own exit code goes
 to `/logs/agent/exit_code`, and the verifier decides pass or fail. `core.py` copies the metrics and infra functions of
 `bench/run.py` (Harbor's interpreter can't import `bench`); a test asserts identical output.
+
+## Timeouts
+
+Tasks differ (TB2 has 600 s to 12000 s agent timeouts; the hard set below mixes 900 s and 1800 s), and Harbor doesn't pass
+the agent its task's timeout. `XolotlAgent.run()` therefore finds it itself, per trial, with no wrapper involvement
+(`core.resolve_timeout`), in this order:
+
+1. `--ak agent_timeout_sec=N`, if given: an explicit override (use it with Harbor's own `--agent-timeout-multiplier` or
+   `--agent-timeout`, which the agent can't see). A bad value (0, negative, not a number) fails when the agent is created.
+2. The task's own `[agent].timeout_sec`: Harbor gives `run()` an environment whose `environment_dir` is the task's
+   `<task>/environment` folder (Harbor's `trial.py`, `environment_dir=self.task.paths.environment_dir`), and `task.toml`
+   sits next to it (for the registry dataset: `~/.cache/harbor/tasks/<hash>/<task>/task.toml`).
+3. Otherwise 900 s, recorded as source `default`.
+
+Xolotl's budget is that value minus 60 s (floor 60 s), so it stops before Harbor kills the container and the logs are
+still copied: 840 s for a 900 s task, 1740 s for a 1800 s one. What each trial really got is written to
+`<trial>/agent/agent_timeout.json` (`agent_timeout_sec`, `source` = `kwarg` / `task.toml` / `default`, `budget_s`) and ends
+up in each trial of `results/<run_id>.json` as `agent_timeout_sec` and `timeout_source` (null for a job from before this
+existed or a trial that never reached `run()`), and in the `limit` column of the summary. A `default` trial prints a
+WARNING: it means `task.toml` wasn't found and the budget may be shorter than the task's real limit. The earlier results
+(smoke and the 15-task subset) only ran 900 s tasks, so their fixed 840 s was right and they stay comparable.
 
 ## Results
 
@@ -79,8 +102,23 @@ job folder with the current parser (no build, no Harbor, no Docker): it runs the
 sha7 in the job name, `dirty` and `harbor_version` are null, and `binary_sha256` is that of the binary on disk now (the
 run's own only if it wasn't rebuilt since). The job folder is only read.
 
-`tasks.txt` (15 tasks: 3 easy, 6 medium, 6 hard, 900 s timeouts) and `smoke.txt` (2 easy) are fixed; changing them changes
-`tasks_hash`.
+## Task sets
+
+`tasks.txt` (15 tasks: 3 easy, 6 medium, 6 hard, 900 s timeouts), `smoke.txt` (2 easy) and `tasks-hard.txt` are fixed;
+changing them changes `tasks_hash`.
+
+`tasks-hard.txt` (selected 2026-10-05) is 12 TB2 tasks of `difficulty = "hard"` that are not in `tasks.txt`, no GPU, spread
+over categories (selection rule at the top of the file):
+
+| Agent timeout (Xolotl budget) | Tasks |
+|---|---|
+| 900 s (840 s) | gpt2-codegolf, make-doom-for-mips, polyglot-rust-c, torch-pipeline-parallelism, torch-tensor-parallelism, write-compressor |
+| 1800 s (1740 s) | feal-differential-cryptanalysis, make-mips-interpreter, path-tracing, protein-assembly, mcmc-sampling-stan, llm-inference-batching-scheduler |
+
+Resource notes: mcmc-sampling-stan asks for 4 cpus / 8 GB, the torch tasks, gpt2-codegolf and protein-assembly for 4 GB,
+the rest 1 cpu / 2 GB, so keep Docker Desktop's memory limit at 8 GB or more and use `-n 2` at most. Image sizes were not
+screened (the torch images carry PyTorch, gpt2-codegolf bakes in the GPT-2 124M checkpoint), so the first run pulls a lot.
+The 1800 s tasks are only fair because of the Timeouts section above: before it, Xolotl was killed at 840 s.
 
 ## Secrets
 
