@@ -4,6 +4,7 @@ then write results/<run_id>.json and a HISTORY.md row. Standard library only (Ha
     py bench/tb2/run.py --smoke --note "tb2 smoke"       # the 2 smoke tasks
     py bench/tb2/run.py --note "tb2 v1 baseline"         # tasks.txt (15 tasks)
     py bench/tb2/run.py --task fix-git --dry-run         # print the Harbor command (key redacted) and let Harbor validate it
+    py bench/tb2/run.py --tasks-file bench/tb2/tasks-hard.txt -n 2 -k 3   # 3 attempts per task: the pass rate is over all trials
 """
 import argparse
 import hashlib
@@ -187,9 +188,11 @@ def _scan_failed(job_dir: Path, key: str) -> int:
     return 3 if hits or unreadable else 0
 
 
-def harbor_command(harbor: str, tasks: list[str], binary: Path, jobs_dir: Path, job_name: str, n: int) -> list[str]:
+def harbor_command(harbor: str, tasks: list[str], binary: Path, jobs_dir: Path, job_name: str, n: int, k: int = 1) -> list[str]:
     cmd = [harbor, "run", "-d", DATASET, "-a", AGENT, "-m", MODEL, "--ak", f"binary={binary}", "-n", str(n),
            "-o", str(jobs_dir), "--job-name", job_name, "-q"]
+    if k > 1:
+        cmd += ["-k", str(k)]
     for t in tasks:
         cmd += ["-i", t]
     return cmd
@@ -228,6 +231,13 @@ def _print_summary(result: dict, path: Path) -> None:
     print(f"\n{s['pass']}/{ran} passed ({s['pass_rate'] * 100:.1f}%), {s['infra']} infra; "
           f"tokens {s['tokens']['prompt']} in / {s['tokens']['completion']} out ({s['tokens']['cached']} cached); "
           f"median agent time {s['median_agent_time_s']:.1f}s")
+    tally: dict[str, list[int]] = {}
+    for t in result["trials"]:
+        if t["status"] != "infra_error":
+            tally.setdefault(t["task"], [0, 0])[0] += t["status"] == "pass"
+            tally[t["task"]][1] += 1
+    if any(n > 1 for _, n in tally.values()):  # several attempts per task: the per-task rate says more than the rows
+        print("per task: " + ", ".join(f"{task} {p}/{n}" for task, (p, n) in tally.items()))
     if s["infra"]:
         print(f"WARNING: {s['infra']} trial(s) are infra_error and excluded from the pass rate; re-run them before trusting this row")
     fallback = sum(t["timeout_source"] == "default" for t in result["trials"])
@@ -244,6 +254,7 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--tasks-file", type=Path, help="one task name per line (default: tasks.txt)")
     g.add_argument("--task", action="append", metavar="NAME", help="a task name; repeat for several")
     p.add_argument("-n", type=int, default=1, help="Harbor concurrency (default 1: least Docker load)")
+    p.add_argument("-k", type=int, default=1, help="attempts per task (Harbor -k); one run's pass rate is over all trials")
     p.add_argument("--note", default="", help="free text for the HISTORY row")
     p.add_argument("--no-build", action="store_true", help="use the already built Linux binary")
     p.add_argument("--dry-run", action="store_true", help="print the Harbor command (key redacted) and let Harbor validate it; no run")
@@ -336,14 +347,15 @@ def reparse(args: argparse.Namespace) -> int:
     import build_linux
     binary = build_linux.binary_path(REPO_ROOT)
     m = re.search(r"-([0-9a-f]{7})(?:-\d+)?$", job_dir.name)
+    attempts = cfg.get("n_attempts") or 1  # Harbor leaves the default (1) out of config.json
     result = make_result(
         trials, tasks, run_id=job_dir.name, job_name=job_dir.name, reparsed=True,
         parser_git_sha=_git("rev-parse", "HEAD") or "unknown", started=started.isoformat(timespec="seconds"),
         git_sha=m.group(1) if m else "unknown", dirty=None, harbor_version=None,
         binary_sha256=file_sha256(binary) if binary.is_file() else None,
         dataset=DATASET, model=((cfg.get("agents") or [{}])[0] or {}).get("model_name") or MODEL,
-        concurrency=cfg.get("n_concurrent_trials"), note=args.note, partial=len(trials) < len(tasks),
-        harbor_exit_code=None)
+        concurrency=cfg.get("n_concurrent_trials"), attempts=attempts, note=args.note,
+        partial=len(trials) < len(tasks) * attempts, harbor_exit_code=None)
     record(result, args.results_dir)
     return 1 if result["partial"] else 0
 
@@ -372,7 +384,7 @@ def main(argv: list[str]) -> int:
     base = f"{started:%Y%m%d-%H%M}-{sha[:7]}"
     run_id = next(r for r in (base if n == 1 else f"{base}-{n}" for n in itertools.count(1))
                   if not (args.jobs_dir / r).exists() and not (args.results_dir / f"{r}.json").exists())
-    cmd = harbor_command(harbor, tasks, binary, args.jobs_dir, run_id, args.n)
+    cmd = harbor_command(harbor, tasks, binary, args.jobs_dir, run_id, args.n, args.k)
 
     if args.dry_run:
         print("harbor command:", subprocess.list2cmdline(cmd), flush=True)
@@ -390,7 +402,7 @@ def main(argv: list[str]) -> int:
     binary_sha256 = file_sha256(binary)  # what this run uploads into every container
 
     args.jobs_dir.mkdir(parents=True, exist_ok=True)
-    print(f"run {run_id}: {len(tasks)} task(s), -n {args.n}", flush=True)
+    print(f"run {run_id}: {len(tasks)} task(s) x {args.k} attempt(s), -n {args.n}", flush=True)
     code = subprocess.run(cmd, env=harbor_env(key), stdin=subprocess.DEVNULL).returncode  # streams Harbor's output
     job_dir = args.jobs_dir / run_id
     if not job_dir.is_dir():
@@ -401,12 +413,13 @@ def main(argv: list[str]) -> int:
         return 3
 
     trials = parse_job(job_dir)
-    partial = code != 0 or len(trials) < len(tasks)
+    partial = code != 0 or len(trials) < len(tasks) * args.k
     result = make_result(
         trials, tasks, run_id=run_id, job_name=run_id, reparsed=False, started=started.isoformat(timespec="seconds"),
         git_sha=sha, dirty=dirty, binary_sha256=binary_sha256,
         harbor_version=subprocess.run([harbor, "--version"], capture_output=True, text=True).stdout.strip(),
-        dataset=DATASET, model=MODEL, concurrency=args.n, note=args.note, partial=partial, harbor_exit_code=code)
+        dataset=DATASET, model=MODEL, concurrency=args.n, attempts=args.k, note=args.note, partial=partial,
+        harbor_exit_code=code)
     record(result, args.results_dir)
     print(f"jobs: {job_dir}")
     return 1 if partial else 0

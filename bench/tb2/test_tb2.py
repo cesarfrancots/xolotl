@@ -407,6 +407,16 @@ class WrapperTests(unittest.TestCase):
             # and the job folder is only ever read
             self.assertEqual(before, {p.relative_to(job).as_posix(): p.read_bytes() for p in job.rglob("*") if p.is_file()})
 
+    def test_reparse_counts_attempts(self):  # with -k 2 the fixture's 5 trials are half the job: partial, no HISTORY row
+        with tempfile.TemporaryDirectory() as d:
+            job, results = Path(d) / "20261004-1200-abc1234", Path(d) / "results"
+            shutil.copytree(JOB, job)
+            (job / "config.json").write_text(json.dumps({"n_attempts": 2}), encoding="utf-8")
+            self.assertEqual(self._reparse(job, results), 1)
+            data = json.loads((results / "20261004-1200-abc1234.json").read_text(encoding="utf-8"))
+            self.assertEqual((data["attempts"], data["partial"]), (2, True))
+            self.assertFalse((results / "HISTORY.md").exists())
+
     def test_reparse_refuses_when_key_prefix_in_job(self):
         with tempfile.TemporaryDirectory() as d:
             job, results = Path(d) / "job", Path(d) / "results"
@@ -432,6 +442,9 @@ class WrapperTests(unittest.TestCase):
         cmd = run.harbor_command("harbor", ["a", "b"], Path("/x/xolotl"), Path("/jobs"), "job1", 1)
         self.assertEqual(cmd[cmd.index("-n") + 1], "1")
         self.assertEqual([cmd[i + 1] for i, c in enumerate(cmd) if c == "-i"], ["a", "b"])
+        self.assertNotIn("-k", cmd)  # one attempt is Harbor's default: the command stays as before
+        k3 = run.harbor_command("harbor", ["a"], Path("/x/xolotl"), Path("/jobs"), "job1", 2, 3)
+        self.assertEqual(k3[k3.index("-k") + 1], "3")
         env = run.harbor_env("sekrit-key")
         self.assertEqual(env[core.KEY_ENV], "sekrit-key")
         self.assertFalse(any("sekrit-key" in part for part in cmd))
