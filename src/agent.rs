@@ -10,7 +10,7 @@ use crate::ui::{Decision, PermissionRequest, Status, Ui, mini_diff, tool_summary
 use serde_json::Value;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How an `Outcome::Error` (or a `/compact` error) from a failed session write starts. After one, the events file may end
 /// in a partial line, so nothing more may be appended to that session.
@@ -33,6 +33,25 @@ pub struct Agent<'a> {
     pub cancel: &'a AtomicBool,
     /// Named in the auth error (spec §12: "check <api_key_env>").
     pub api_key_env: &'a str,
+    /// `--deadline`: when set, the effort cap and `time` nudges follow the time left (policy.rs).
+    pub deadline: Option<Deadline>,
+}
+
+/// The moment a run will be killed, and the budget it started with.
+#[derive(Clone, Copy)]
+pub struct Deadline {
+    end: Instant,
+    total: Duration,
+}
+
+impl Deadline {
+    pub fn new(start: Instant, total: Duration) -> Self {
+        Deadline { end: start + total, total }
+    }
+
+    fn remaining(&self) -> Duration {
+        self.end.saturating_duration_since(Instant::now())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -189,6 +208,7 @@ impl Agent<'_> {
         let (mut steps, mut check_fired, mut edited, mut empty_retried, mut overflow_retried) = (0, false, false, false, false);
         let mut recent: Vec<Seen> = Vec::new(); // tool results since the last repeat nudge
         let mut stage2_failed = false;
+        let mut time_notes = 0;
         loop {
             // Before every model call, a request's first included: tool-free turns grow the context too. Not while a
             // Ctrl+C is pending: the check below ends the request, and a summary call now would only be cut short.
@@ -205,6 +225,7 @@ impl Agent<'_> {
                 }
                 steps = 0;
             }
+            self.pace(&mut time_notes)?;
             let view = policy::build_view(&self.session.events);
             let t0 = Instant::now();
             let ui = &mut *self.ui;
@@ -289,6 +310,21 @@ impl Agent<'_> {
             }
             recent.drain(..recent.len().saturating_sub(n));
         }
+    }
+
+    /// With a deadline, before every model call: caps the reasoning effort by the time left, and the first time the budget
+    /// falls to each `time_note_pct` threshold adds one `time` nudge. `notes`: how many thresholds have fired.
+    fn pace(&mut self, notes: &mut usize) -> Result<(), Outcome> {
+        let Some(d) = self.deadline else { return Ok(()) };
+        let left = d.remaining();
+        self.model.cap_effort(policy::effort_cap(left));
+        let pct = (left.as_secs_f64() * 100.0 / d.total.as_secs_f64()) as u64;
+        let crossed = LIMITS.time_note_pct.iter().filter(|&&p| pct <= p).count();
+        if crossed > *notes {
+            *notes = crossed;
+            self.append(nudge("time", policy::time_note(crossed - 1, left)))?;
+        }
+        Ok(())
     }
 
     /// Validates, gates and runs one call, appending its `permission` and `tool_result` events. Returns what the
@@ -526,7 +562,7 @@ mod tests {
             .unwrap();
         let tools = ToolCtx { root: proj, shell: tools::resolve_shell(), backups_dir: session.artifacts_dir(), reads: HashMap::new(), secret_env: vec![] };
         let perms = Perms::new(mode, headless, session.dir.clone(), vec![]);
-        Agent { session, model, ui, perms, tools, budget: 200_000, cancel, api_key_env: "XOLOTL_TEST_KEY" }
+        Agent { session, model, ui, perms, tools, budget: 200_000, cancel, api_key_env: "XOLOTL_TEST_KEY", deadline: None }
     }
 
     fn has_bash() -> bool {
@@ -634,6 +670,66 @@ mod tests {
         assert_eq!(ui.statuses.len(), 1);
         assert_eq!((ui.statuses[0].tool_calls, ui.statuses[0].budget), (2, 200_000));
         assert_eq!(ui.started, ["c1", "c2"]);
+    }
+
+    fn deadline_in(left_s: u64, total_s: u64) -> Deadline {
+        Deadline { end: Instant::now() + Duration::from_secs(left_s), total: Duration::from_secs(total_s) }
+    }
+
+    #[test]
+    fn without_a_deadline_nothing_is_paced() {
+        let mut m = Scripted::new(vec![read_a("c1"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("nopace", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert!(m.caps.is_empty() && nudges(&session.events, "time").is_empty());
+    }
+
+    #[test]
+    fn deadline_caps_effort_and_notes_each_threshold_once() {
+        // 400 s of 1000 s left: past the 50% threshold, under the 1000 s effort mark, over the 240 s one
+        let mut m = Scripted::new(vec![read_a("c1"), read_a("c2"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("pace", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(400, 1000));
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(m.caps, [Some("medium".to_string()), Some("medium".into()), Some("medium".into())]); // one per model call
+        let notes = nudges(&session.events, "time");
+        assert_eq!(notes.len(), 1, "three calls, one note: {notes:?}");
+        assert!(notes[0].contains("about 7 minutes") && notes[0].contains("exists and works now"), "{}", notes[0]);
+        // the note sits before the first call, merged into the request's user message, so the model sees it at once
+        let first = last_user(&m.requests[0]);
+        assert!(first.starts_with("look") && first.contains("Time check"), "{first}");
+    }
+
+    #[test]
+    fn deadline_far_past_both_thresholds_adds_only_the_last_note() {
+        let mut m = Scripted::new(vec![read_a("c1"), text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("pace2", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(100, 1000)); // 10% left: both thresholds crossed at once
+        fs::write(a.tools.root.join("a.txt"), "hello\n").unwrap();
+        assert_eq!(a.run_request("look"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(m.caps, [Some("low".to_string()), Some("low".into())]);
+        let notes = nudges(&session.events, "time");
+        assert!(notes.len() == 1 && notes[0].contains("Wrap up"), "{notes:?}");
+    }
+
+    #[test]
+    fn plenty_of_time_means_no_cap_and_no_note() {
+        let mut m = Scripted::new(vec![text("done")]);
+        let (mut ui, cancel) = (TestUi::default(), AtomicBool::new(false));
+        let mut a = agent("pace3", Mode::Yolo, false, &mut m, &mut ui, &cancel);
+        a.deadline = Some(deadline_in(3000, 3600));
+        assert_eq!(a.run_request("hi"), Outcome::Done);
+        let Agent { session, .. } = a;
+        assert_eq!(m.caps, [None]); // the cap is lifted explicitly, so an earlier one cannot stick
+        assert!(nudges(&session.events, "time").is_empty());
     }
 
     #[test]
@@ -1319,7 +1415,7 @@ mod tests {
         assert!(stages(&session.events).is_empty());
 
         // the latch is per request
-        let mut a = Agent { session, model: &mut m, ui: &mut ui, perms, tools, budget: 3_000, cancel: &cancel, api_key_env: "XOLOTL_TEST_KEY" };
+        let mut a = Agent { session, model: &mut m, ui: &mut ui, perms, tools, budget: 3_000, cancel: &cancel, api_key_env: "XOLOTL_TEST_KEY", deadline: None };
         assert_eq!(a.run_request("again"), Outcome::Done);
         let session = a.session;
         assert_eq!(m.requests.len(), 7);
@@ -1354,7 +1450,7 @@ mod tests {
             reasoning_effort: cfg.reasoning_effort,
         });
         let (mut ui, cancel) = (Headless { out: Vec::new() }, AtomicBool::new(false));
-        let mut a = Agent { session, model: &mut model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &cancel, api_key_env: &ctx.api_key_env };
+        let mut a = Agent { session, model: &mut model, ui: &mut ui, perms, tools, budget: ctx.budget, cancel: &cancel, api_key_env: &ctx.api_key_env, deadline: None };
         let outcome = a.run_request("Create a file named hello.txt containing exactly: hi");
         eprintln!("session: {}", a.session.dir.display());
         assert_eq!(outcome, Outcome::Done, "{}", String::from_utf8_lossy(&ui.out));
