@@ -1,0 +1,23 @@
+# TB2 fixed subset (selected 2026-10-04 from terminal-bench@2.0 task.toml metadata). Changing this file changes tasks_hash.
+# Rule: 15 tasks = 3 easy + 6 medium + 6 hard by TB2 `difficulty`; varied categories; all with a 900 s agent timeout (so
+# Xolotl's 840 s budget fits), 1 cpu / 2 GB, no GPU, no multi-GB model or data downloads.
+# Only 4 easy tasks exist in TB2 (overfull-hbox has a 750 s timeout and is left out), hence 3 easy.
+# Names are Harbor's `-i` include form; verify with `py bench/tb2/run.py --dry-run`.
+# easy
+fix-git
+cobol-modernization
+prove-plus-comm
+# medium
+log-summary-date-ranges
+build-cython-ext
+db-wal-recovery
+build-pmars
+nginx-request-logging
+raman-fitting
+# hard
+fix-code-vulnerability
+password-recovery
+cancel-async-tasks
+model-extraction-relu-logits
+configure-git-webserver
+sparql-university

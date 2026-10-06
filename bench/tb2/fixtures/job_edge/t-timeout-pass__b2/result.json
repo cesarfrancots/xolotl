@@ -1,0 +1,39 @@
+{
+  "task_name": "t-timeout-pass",
+  "trial_name": "t-timeout-pass__b2",
+  "task_checksum": "checksum-of-t-timeout-pass",
+  "agent_info": {
+    "name": "xolotl",
+    "version": "xolotl 0.1.0",
+    "model_info": {
+      "name": "glm-5.3-flash",
+      "provider": "zai"
+    }
+  },
+  "verifier_result": {
+    "rewards": {
+      "reward": 1.0
+    }
+  },
+  "exception_info": {
+    "exception_type": "AgentTimeoutError",
+    "exception_message": "Agent execution timed out after 900.0 seconds",
+    "exception_traceback": "",
+    "occurred_at": "2026-10-04T10:00:00Z"
+  },
+  "agent_execution": {
+    "started_at": "2026-10-04T10:00:00Z",
+    "finished_at": "2026-10-04T10:15:00Z"
+  },
+  "agent_result": {
+    "n_input_tokens": 300,
+    "n_cache_tokens": 50,
+    "n_output_tokens": 50,
+    "metadata": {
+      "model_calls": 2,
+      "tool_calls": 1,
+      "exit_code": null,
+      "infra_reason": null
+    }
+  }
+}

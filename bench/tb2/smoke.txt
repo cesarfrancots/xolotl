@@ -1,0 +1,4 @@
+# TB2 smoke set (2026-10-04): 2 easy tasks, 900 s agent timeout, python:3.13-slim base (one shared image layer, no GPU/heavy deps).
+# Names are Harbor's `-i` include form (task name in terminal-bench@2.0); verify with `py bench/tb2/run.py --smoke --dry-run`.
+fix-git
+cobol-modernization

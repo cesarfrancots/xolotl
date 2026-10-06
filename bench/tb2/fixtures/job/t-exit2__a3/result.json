@@ -1,0 +1,34 @@
+{
+  "task_name": "t-exit2",
+  "trial_name": "t-exit2__a3",
+  "task_checksum": "checksum-of-t-exit2",
+  "agent_info": {
+    "name": "xolotl",
+    "version": "xolotl 0.1.0",
+    "model_info": {
+      "name": "glm-5.3-flash",
+      "provider": "zai"
+    }
+  },
+  "verifier_result": {
+    "rewards": {
+      "reward": 1.0
+    }
+  },
+  "exception_info": null,
+  "agent_execution": {
+    "started_at": "2026-10-04T10:00:00Z",
+    "finished_at": "2026-10-04T10:05:00Z"
+  },
+  "agent_result": {
+    "n_input_tokens": 300,
+    "n_cache_tokens": 50,
+    "n_output_tokens": 50,
+    "metadata": {
+      "model_calls": 2,
+      "tool_calls": 1,
+      "exit_code": 2,
+      "infra_reason": null
+    }
+  }
+}

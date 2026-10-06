@@ -1,0 +1,21 @@
+{
+  "task_name": "t-setup",
+  "trial_name": "t-setup__a4",
+  "task_checksum": "checksum-of-t-setup",
+  "agent_info": {
+    "name": "xolotl",
+    "version": "xolotl 0.1.0",
+    "model_info": {
+      "name": "glm-5.3-flash",
+      "provider": "zai"
+    }
+  },
+  "verifier_result": null,
+  "exception_info": {
+    "exception_type": "RuntimeError",
+    "exception_message": "Agent install failed: xolotl linux binary not found",
+    "exception_traceback": "",
+    "occurred_at": "2026-10-04T10:00:00Z"
+  },
+  "agent_execution": null
+}

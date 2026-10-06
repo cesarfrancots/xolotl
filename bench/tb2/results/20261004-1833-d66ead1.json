@@ -1,0 +1,96 @@
+{
+  "run_id": "20261004-1833-d66ead1",
+  "job_name": "20261004-1833-d66ead1",
+  "reparsed": true,
+  "parser_git_sha": "081eba7d98244d578870b7ba7cb6e6a668941207",
+  "started": "2026-10-04T18:33:24-06:00",
+  "git_sha": "d66ead1",
+  "dirty": null,
+  "harbor_version": null,
+  "binary_sha256": "e020c273a3b90b22ee732e5166be70cf67c40e347cf28d9f2b77b7960a3a2a96",
+  "dataset": "terminal-bench@2.0",
+  "model": "zai/glm-5.3-flash",
+  "concurrency": 1,
+  "note": "tb2 smoke",
+  "partial": false,
+  "harbor_exit_code": null,
+  "xolotl_version": "xolotl 0.1.0",
+  "policy_hash": "e381398ffa98e555",
+  "tasks": [
+    "fix-git",
+    "cobol-modernization"
+  ],
+  "tasks_hash": "81b4e82bd576",
+  "trials": [
+    {
+      "task": "cobol-modernization",
+      "trial": "cobol-modernization__adYcV2Q",
+      "task_checksum": "def98d1cb8485087d945d0189a22da7fb4a082e36d4b1f2b99a2b20da9975cb7",
+      "status": "fail",
+      "reward": 0.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 124,
+      "tokens": {
+        "prompt": 717466,
+        "completion": 33915,
+        "cached": 671488
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 29,
+        "tool_calls": 31,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 124,
+        "infra_reason": null
+      },
+      "agent_time_s": 840.657,
+      "xolotl_version": "xolotl 0.1.0"
+    },
+    {
+      "task": "fix-git",
+      "trial": "fix-git__UNgaMDV",
+      "task_checksum": "485519dd203d247a047ab4f911ae0e11df1210397b2fa7df62a3b0edc3f9eaba",
+      "status": "pass",
+      "reward": 1.0,
+      "exception": null,
+      "infra_reason": "",
+      "exit_code": 0,
+      "tokens": {
+        "prompt": 104915,
+        "completion": 6552,
+        "cached": 93568
+      },
+      "policy_hash": "e381398ffa98e555",
+      "metadata": {
+        "model_calls": 18,
+        "tool_calls": 23,
+        "compactions": {
+          "stage1": 0,
+          "stage2": 0
+        },
+        "policy_hash": "e381398ffa98e555",
+        "exit_code": 0,
+        "infra_reason": null
+      },
+      "agent_time_s": 205.636,
+      "xolotl_version": "xolotl 0.1.0"
+    }
+  ],
+  "summary": {
+    "pass": 1,
+    "total": 2,
+    "infra": 0,
+    "pass_rate": 0.5,
+    "tokens": {
+      "prompt": 822381,
+      "completion": 40467,
+      "cached": 765056
+    },
+    "median_agent_time_s": 523.147
+  }
+}
